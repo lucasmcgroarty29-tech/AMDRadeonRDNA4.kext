@@ -47,6 +47,14 @@ int main() {
 		CHECK(!PvGuestMemory::fitsRange(4097, 0, 4096));
 		CHECK(PvGuestMemory::fitsRange(UINT64_MAX - 7, 7, UINT64_MAX));
 		CHECK(!PvGuestMemory::fitsRange(UINT64_MAX - 7, 8, UINT64_MAX));
+		CHECK(PvGuestMemory::fitsGuestAddressSpace(0, 1));
+		CHECK(PvGuestMemory::fitsGuestAddressSpace((16ull << 30) - 1, 1));
+		CHECK(PvGuestMemory::fitsGuestAddressSpace(0, 16ull << 30));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace((16ull << 30) - 1, 2));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(16ull << 30, 1));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(0, (16ull << 30) + 1));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(UINT64_MAX, 1));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(0, 0));
 	}
 
 	// Head identity compares semantic fields, not unspecified struct padding.
