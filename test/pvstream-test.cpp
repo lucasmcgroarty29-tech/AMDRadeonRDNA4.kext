@@ -40,6 +40,20 @@ int main() {
 		CHECK(!PvGuestMemory::makePageRange(0, 0, range));
 	}
 
+	// GPU-present source extent: divide before multiplying and subtract before adding.
+	{
+		uint64_t bytes = 0;
+		CHECK(PvScanout::makeSurfaceRange(64, 64 + 4096ull * 2, 4096, 2, bytes));
+		CHECK(bytes == 8192);
+		CHECK(!PvScanout::makeSurfaceRange(64, 64 + 8191, 4096, 2, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(65, 64, 4096, 1, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, 0, 1, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, 4096, 0, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, UINT64_MAX, 2, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(UINT64_MAX - 7, UINT64_MAX, 8, 1, bytes));
+		CHECK(PvScanout::makeSurfaceRange(UINT64_MAX - 7, UINT64_MAX, 8, 0, bytes) == false);
+	}
+
 	// IOSurface-to-scanout layout validation: exact bounds, clipping and overflow-safe final-row checks.
 	{
 		PvScanout::CopyLayout layout {};
