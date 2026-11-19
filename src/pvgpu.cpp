@@ -2763,6 +2763,9 @@ uint32_t RDNA4PvHost::guestPfn(uint32_t task, uint64_t va, bool write) {
 // walked to once for all of its pages (a page each would map 4 table pages: 32768 mappings for a 4K target); false if one is not mapped.
 // `writable`: whether the table lets the GPU write all of them (bit 31, as guestPfn checks for a write).
 bool RDNA4PvHost::guestPages(uint32_t task, uint64_t va, uint64_t count, uint64_t *pages, bool *writable) {
+	if (!pages || !count || (va & 0xfff) || va >= PvGuestMemory::kGuestAddressSpaceBytes ||
+	    count > ((PvGuestMemory::kGuestAddressSpaceBytes - va) >> 12))
+		return false;
 	if (writable)
 		*writable = true;
 
@@ -2823,6 +2826,10 @@ void RDNA4PvHost::dumpGuest(uint32_t task, uint64_t va, uint32_t len) {
 // M1: [va, va + len) of a task's GPU address space, page by page through its page table, copied out (or, for writeGuest, in); false at the first
 // page that is not mapped.
 bool RDNA4PvHost::copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest) {
+	if (!len)
+		return true;
+	if (!buf || !PvGuestMemory::fitsGuestAddressSpace(va, len))
+		return false;
 	if (mRingWriteCount && ringWritten(task, va, len))   // a dispatch in the batch writes it: done first
 		waitDraws();
 
@@ -3300,7 +3307,7 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 	// where in its allocation the texture starts (dwords 4-5; 0x100 for CoreAnimation's text images, measured 2026-11-05)
 	const uint64_t start = desc[4] | static_cast<uint64_t>(desc[5]) << 32;
 
-	if (start >= *len)
+	if (start >= *len || !PvGuestMemory::fitsGuestAddressSpace(*va, *len))
 		return false;
 
 	*va += start;
@@ -3320,7 +3327,7 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 			if (desc[j - 1] == 0x2c && desc[j] == id)
 				*format = desc[j + 1] >> 16;
 	}
-	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+	return *len && *len <= (1ull << 30) && PvGuestMemory::fitsGuestAddressSpace(*va, *len) && guestPfn(task, *va);
 }
 
 // M4: an IOSurface-backed texture (resource type 5, 56 bytes: dword 0 the IOSurface id, dword 5 the Metal pixel format << 16 | ?, dwords 6
@@ -4423,7 +4430,7 @@ bool RDNA4PvHost::levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_
 		*format = s.format;
 	if (storage)
 		*storage = 0;   // ponytail: the stats count a level's draws as shared
-	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+	return *len && *len <= (1ull << 30) && PvGuestMemory::fitsGuestAddressSpace(*va, *len) && guestPfn(task, *va);
 }
 
 // A stage's textures' levels 1-7 for a shader that samples at explicit LODs (RDNA4_MTLC_LEVEL_FIRST): each level of the guest's memory in
