@@ -3277,7 +3277,7 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 	}
 	*len = desc[0];
 	*va = desc[1] << 12;
-	return desc[0] && desc[1] < (1ull << 36) && guestPfn(task, *va);
+	return PvGuestMemory::fitsGuestAddressSpace(*va, *len) && desc[1] < (1ull << 36) && guestPfn(task, *va);
 }
 
 // M2: a texture's GPU range: a type-2 resource with a 116-byte descriptor, dwords {u64 size in bytes, u32 page number of its start, ...,
@@ -4308,11 +4308,14 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 			out.height = v[10];
 			out.depth = 1;
 			out.rowBytes = static_cast<uint32_t>(bpr);
-			out.va = bva + offset;
+			if (!PvGuestMemory::fitsGuestAddressSpace(bva, blen))
+				return false;
+			if (!PvGuestMemory::checkedAdd(bva, offset, out.va))
+				return false;
 			out.length = blen - offset;
 			out.imageBytes = out.length;
 
-			return true;
+			return PvGuestMemory::fitsGuestAddressSpace(out.va, out.length);
 		}
 		// Kind 8, a view (newTextureViewWithPixelFormat:textureType:levels:slices:[swizzle:]baseTexture:): {8 (0x1b with a swizzle), size, id,
 		// the texture's id, u16 pixel format, u16 texture type, u64 level, u64 levels, u64 slice, u64 slices[, u8 swizzle x 4]}. Its texture
@@ -4321,22 +4324,27 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 		const uint64_t first = v[5] | static_cast<uint64_t>(v[6]) << 32, slice = v[9] | static_cast<uint64_t>(v[10]) << 32;
 		const uint32_t swizzle = v[0] == 0x1b && have >= 56 ? v[13] : 0;
 
-		if (!view || !parent || parent == id || first + level > 15 || nesting > 1)
+		if (!view || !parent || parent == id || first > 15 || level > 15 - first || nesting > 1)
 			return false;
 		nesting++;
 		const bool ok = textureSource(task, parent, out, level + static_cast<uint32_t>(first));
 		nesting--;
 		const TextureFormat *was = textureFormat(out.format), *now = textureFormat(format);
-		if (!ok || (format && format != out.format && (!was || !now || was->bpp != now->bpp)) || slice >= out.slices)
+		if (!ok || (format && format != out.format && (!was || !now || was->bpp != now->bpp)) || slice >= out.slices ||
+		    !PvGuestMemory::fitsGuestAddressSpace(out.va, out.length))
+			return false;
+		uint64_t sliceOffset = 0, sliceVa = 0;
+		if ((slice && !out.sliceBytes) || !PvGuestMemory::checkedMultiply(slice, out.sliceBytes, sliceOffset) ||
+		    sliceOffset >= out.length || !PvGuestMemory::checkedAdd(out.va, sliceOffset, sliceVa))
 			return false;
 		if (format)
 			out.format = format;
-		out.va += slice * out.sliceBytes;
-		out.length -= slice * out.sliceBytes;
+		out.va = sliceVa;
+		out.length -= sliceOffset;
 		out.slices -= static_cast<uint32_t>(slice);
 		out.swizzle = swizzle;
 
-		return true;
+		return PvGuestMemory::fitsGuestAddressSpace(out.va, out.length);
 	}
 	if (out.type == 5) {
 		if (!surfaceRange(task, id, out.surface))
@@ -4389,12 +4397,16 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 
 	// Where in its allocation the texture starts: dwords 4-5 (CoreAnimation's text images start 0x100 into theirs). Read from the
 	// allocation's start, text came out shifted by a row and a bit, its end at its start (rdna4_pvtex, 2026-11-05).
-	const uint64_t start = (td[4] | static_cast<uint64_t>(td[5]) << 32) + (lv[0] | static_cast<uint64_t>(lv[1]) << 32);
+	uint64_t start = 0, adjustedVa = 0;
+	const uint64_t allocationOffset = td[4] | static_cast<uint64_t>(td[5]) << 32;
+	const uint64_t levelOffset = lv[0] | static_cast<uint64_t>(lv[1]) << 32;
 
-	if (start >= out.length)
+	if (!PvGuestMemory::fitsGuestAddressSpace(out.va, out.length) ||
+	    !PvGuestMemory::checkedAdd(allocationOffset, levelOffset, start) || start >= out.length ||
+	    !PvGuestMemory::checkedAdd(out.va, start, adjustedVa))
 		return false;
 
-	out.va += start;
+	out.va = adjustedVa;
 	out.length -= start;
 	// an array's slices (WindowServer's 16384x1x3 R32Float: dword 3 0x00030001, dwords 6-7 0x10000; measured 2026-11-05)
 	out.slices = td[3] >> 16 ? td[3] >> 16 : 1;
@@ -4407,7 +4419,7 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 		      out.depth, td[9] | static_cast<unsigned long long>(td[10]) << 32, td[11] | static_cast<unsigned long long>(td[12]) << 32, out.rowBytes,
 		      static_cast<unsigned long long>(out.length));
 
-	return true;
+	return PvGuestMemory::fitsGuestAddressSpace(out.va, out.length);
 }
 
 // textureRange of a mipmapped texture's level (a pass's attachment level: WindowServer's glass blurs each level from the one before, Tahoe):
