@@ -3359,11 +3359,25 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 	bool ok = false;
 	if (md) {
 		const uint64_t base = gSurfaceFns.baseOffset(s), bpr = gSurfaceFns.bytesPerRow(s);
+		const uint64_t length = md->getLength();
 		if (bpr) {
-			width = width < bpr / 4 ? width : static_cast<uint32_t>(bpr / 4);
+			const uint64_t sourceWidth = bpr / 4;
+			const uint64_t destinationWidth = pitch / 4;
+			if (width > sourceWidth)
+				width = static_cast<uint32_t>(sourceWidth);
+			if (width > destinationWidth)
+				width = static_cast<uint32_t>(destinationWidth);
 			height = height < gSurfaceFns.height(s) ? height : gSurfaceFns.height(s);
 		}
-		if (bpr && width && height && base + bpr * height <= md->getLength() && md->prepare() == kIOReturnSuccess) {
+		/*
+		 * Validate the bytes actually read, including the last row, without
+		 * allowing base + stride * height to wrap. Also keep every row inside
+		 * the caller's destination pitch.
+		 */
+		const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
+		const bool sourceRangeValid = bpr && width && height && base <= length && rowBytes <= length - base &&
+			(height - 1) <= (length - base - rowBytes) / bpr;
+		if (sourceRangeValid && rowBytes <= pitch && md->prepare() == kIOReturnSuccess) {
 			ok = true;
 			/*
 			 * The common scanout case has identical source and destination pitches.
