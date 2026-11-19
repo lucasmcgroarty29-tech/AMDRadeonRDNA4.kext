@@ -10,7 +10,6 @@
 #define PvGuestMemory_hpp
 
 #include <stdint.h>
-#include <limits.h>
 
 namespace PvGuestMemory
 {
