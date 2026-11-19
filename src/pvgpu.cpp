@@ -3377,7 +3377,7 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 	if (md) {
 		const uint64_t base = gSurfaceFns.baseOffset(s), bpr = gSurfaceFns.bytesPerRow(s);
 		CopyLayout layout {};
-		if (makeCopyLayout(base, md->getLength(), bpr, gSurfaceFns.height(s), pitch, width, height, layout) &&
+		if (makeCopyLayout(base, md->getLength(), bpr, gSurfaceFns.width(s), gSurfaceFns.height(s), pitch, width, height, layout) &&
 		    md->prepare() == kIOReturnSuccess) {
 			width = layout.width;
 			height = layout.height;
@@ -8153,7 +8153,9 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	}
 
 	const uint64_t base = md ? gSurfaceFns.baseOffset(s) : 0, bpr = md ? gSurfaceFns.bytesPerRow(s) : 0;
-	const uint32_t width = bpr && h.width < bpr / 4 ? h.width : static_cast<uint32_t>(bpr / 4);
+	uint32_t width = frameW < h.width ? frameW : h.width;
+	if (bpr / 4 < width)
+		width = static_cast<uint32_t>(bpr / 4);
 
 	// larger than the head both ways: a scaled mode's frame, scaled down into the scanout (else the head's part of it is copied)
 	const bool scaled = frameW > h.width && frameH > h.height && bpr / 4 >= frameW && scaleKernel();
