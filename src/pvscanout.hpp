@@ -73,6 +73,11 @@ struct Head {
 	uint32_t width, height;
 };
 
+/* Compare the defined fields, never ABI padding that may be indeterminate. */
+inline bool sameHead(const Head &a, const Head &b) {
+	return a.phys == b.phys && a.pitch == b.pitch && a.width == b.width && a.height == b.height;
+}
+
 /* At plugin start: debug.rdna4_pvheads, -1 until decided() (rdna4-iop switches IOPresentment by it). */
 void start();
 
