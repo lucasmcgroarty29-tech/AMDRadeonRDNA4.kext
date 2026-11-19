@@ -21,9 +21,9 @@ struct PageRange {
 	uint64_t windowOffset;
 };
 
-inline bool fitsDescriptor(uint64_t offset, uint64_t bytes, uint64_t length)
+inline bool fitsRange(uint64_t offset, uint64_t bytes, uint64_t length)
 {
-	return bytes && offset <= length && bytes <= length - offset;
+	return offset <= length && bytes <= length - offset;
 }
 
 inline bool makePageRange(uint64_t address, uint64_t bytes, PageRange &out)
