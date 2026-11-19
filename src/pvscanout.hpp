@@ -45,14 +45,16 @@ inline bool makeSurfaceRange(uint64_t base, uint64_t length, uint64_t pitch, uin
 	return true;
 }
 
-inline bool makeCopyLayout(uint64_t base, uint64_t length, uint64_t sourcePitch, uint32_t sourceHeight,
+inline bool makeCopyLayout(uint64_t base, uint64_t length, uint64_t sourcePitch, uint32_t sourceWidth, uint32_t sourceHeight,
                            uint32_t destinationPitch, uint32_t width, uint32_t height, CopyLayout &out) {
-	if (!sourcePitch || !destinationPitch || !sourceHeight || !width || !height)
+	if (!sourcePitch || !sourceWidth || !destinationPitch || !sourceHeight || !width || !height)
 		return false;
-	const uint64_t sourceWidth = sourcePitch / 4;
+	const uint64_t pitchWidth = sourcePitch / 4;
 	const uint64_t destinationWidth = destinationPitch / 4;
 	if (width > sourceWidth)
-		width = static_cast<uint32_t>(sourceWidth);
+		width = sourceWidth;
+	if (width > pitchWidth)
+		width = static_cast<uint32_t>(pitchWidth);
 	if (width > destinationWidth)
 		width = static_cast<uint32_t>(destinationWidth);
 	if (height > sourceHeight)
