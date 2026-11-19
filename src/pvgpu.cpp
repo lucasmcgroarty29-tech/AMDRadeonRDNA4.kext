@@ -5581,7 +5581,11 @@ bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, b
 
 // The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
 bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
-	const uint64_t first = offset & ~0xfffull, count = (offset + bytes + 0xfff - first) >> 12;
+	PvGuestMemory::PageRange range {};
+	if (!memory || !PvGuestMemory::fitsDescriptor(offset, bytes, memory->getLength()) ||
+	    !PvGuestMemory::makePageRange(offset, bytes, range))
+		return false;
+	const uint64_t first = range.first, count = range.count;
 
 	if (const Mapping *m = !(offset & 0xff) ? keyedMapping(memory, 0, first, count) : nullptr) {
 		handle = 0;
@@ -5602,8 +5606,14 @@ bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_
 		ok = phys && !(phys & 0xfff) && length;
 
 		// physical memory breaks only at page boundaries: a segment ending inside a page ends where the descriptor does
-		for (uint64_t p = 0; ok && p < (length + 0xfff) >> 12 && i < count; p++, i++)
+		const uint64_t segmentPages = length ? (static_cast<uint64_t>(length) - 1) / 4096 + 1 : 0;
+		for (uint64_t p = 0; ok && p < segmentPages && i < count; p++, i++) {
+			if (p > (UINT64_MAX - phys) / 4096) {
+				ok = false;
+				break;
+			}
 			pages[i] = phys + (p << 12);
+		}
 	}
 
 	ok = ok && mapPages(pages, count, handle, gpu, &entry);
