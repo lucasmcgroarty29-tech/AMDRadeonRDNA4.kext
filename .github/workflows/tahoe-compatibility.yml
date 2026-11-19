@@ -11,6 +11,10 @@ on:
       - tahoe-26.7.3-compat-audit
   workflow_dispatch:
 
+concurrency:
+  group: tahoe-compatibility-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
