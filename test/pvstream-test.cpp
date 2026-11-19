@@ -40,6 +40,20 @@ int main() {
 		CHECK(!PvGuestMemory::makePageRange(0, 0, range));
 	}
 
+	// Head identity compares semantic fields, not unspecified struct padding.
+	{
+		PvScanout::Head a, b;
+		std::memset(&a, 0xa5, sizeof(a));
+		std::memset(&b, 0x5a, sizeof(b));
+		a.phys = b.phys = 0x12345000;
+		a.pitch = b.pitch = 7680;
+		a.width = b.width = 1920;
+		a.height = b.height = 1080;
+		CHECK(PvScanout::sameHead(a, b));
+		b.height++;
+		CHECK(!PvScanout::sameHead(a, b));
+	}
+
 	// GPU-present source extent: divide before multiplying and subtract before adding.
 	{
 		uint64_t bytes = 0;
