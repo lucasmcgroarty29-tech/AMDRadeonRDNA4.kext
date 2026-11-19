@@ -3365,8 +3365,19 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 		}
 		if (bpr && width && height && base + bpr * height <= md->getLength() && md->prepare() == kIOReturnSuccess) {
 			ok = true;
-			for (uint32_t y = 0; y < height && ok; y++)
-				ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, 4ull * width) == 4ull * width;
+			/*
+			 * The common scanout case has identical source and destination pitches.
+			 * Read the whole image in one descriptor operation instead of issuing
+			 * one readBytes() call per row (1080 calls for a 1080p frame).
+			 * Keep the row path for cropped or differently-pitched surfaces.
+			 */
+			if (bpr == pitch && static_cast<uint64_t>(width) * 4 == bpr) {
+				const uint64_t bytes = bpr * height;
+				ok = md->readBytes(base, dst, bytes) == bytes;
+			} else {
+				for (uint32_t y = 0; y < height && ok; y++)
+					ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, 4ull * width) == 4ull * width;
+			}
 			md->complete();
 		}
 	}
