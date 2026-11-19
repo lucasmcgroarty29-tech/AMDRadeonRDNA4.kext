@@ -1,5 +1,6 @@
 // Host test of src/pvstream.cpp: the three layers' framing and the generated opcode tables (docs/m1-stream.md).
 #include "../src/pvstream.hpp"
+#include "../src/pvscanout.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -20,6 +21,19 @@ static void sink(void *u, uint32_t id, const char *name, const uint8_t *, uint32
 }
 
 int main() {
+	// IOSurface-to-scanout layout validation: exact bounds, clipping and overflow-safe final-row checks.
+	{
+		PvScanout::CopyLayout layout {};
+		CHECK(PvScanout::makeCopyLayout(0, 1920ull * 4 * 1080, 1920ull * 4, 1080, 1920u * 4, 1920, 1080, layout));
+		CHECK(layout.width == 1920 && layout.height == 1080 && layout.rowBytes == 7680);
+		CHECK(PvScanout::makeCopyLayout(64, 8192, 4096, 2, 2048, 1024, 4, layout));
+		CHECK(layout.width == 512 && layout.height == 2 && layout.rowBytes == 2048);
+		CHECK(!PvScanout::makeCopyLayout(8193, 8192, 4096, 2, 4096, 1024, 2, layout)); // base beyond descriptor
+		CHECK(!PvScanout::makeCopyLayout(0, 8191, 4096, 2, 4096, 1024, 2, layout));  // final row truncated
+		CHECK(!PvScanout::makeCopyLayout(0, 8192, 0, 2, 4096, 1024, 2, layout));     // zero source stride
+		CHECK(!PvScanout::makeCopyLayout(0, 8192, 4096, 2, 3, 1, 2, layout));         // destination row too narrow
+		CHECK(!PvScanout::makeCopyLayout(UINT64_MAX - 8, UINT64_MAX, 4096, 2, 4096, 1024, 2, layout));
+	}
 	// tables: sorted, spot checks against what the disassembly showed
 	int32_t len = 0;
 	CHECK(std::strcmp(streamName(0x132, &len), "Blit.fillBuffer") == 0 && len == 24);
