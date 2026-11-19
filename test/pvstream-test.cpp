@@ -50,8 +50,9 @@ int main() {
 		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, 0, 1, bytes));
 		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, 4096, 0, bytes));
 		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, UINT64_MAX, 2, bytes));
+		CHECK(PvScanout::makeSurfaceRange(UINT64_MAX - 8, UINT64_MAX, 8, 1, bytes));
+		CHECK(bytes == 8); // exact final byte of the largest representable descriptor
 		CHECK(!PvScanout::makeSurfaceRange(UINT64_MAX - 7, UINT64_MAX, 8, 1, bytes));
-		CHECK(PvScanout::makeSurfaceRange(UINT64_MAX - 7, UINT64_MAX, 8, 0, bytes) == false);
 	}
 
 	// IOSurface-to-scanout layout validation: exact bounds, clipping and overflow-safe final-row checks.
