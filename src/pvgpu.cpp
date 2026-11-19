@@ -2750,7 +2750,9 @@ void RDNA4PvHost::dumpPage(const char *what, uint32_t pfn) {
 // may write the page: WindowServer's read-only textures (resource type 3) have entries without it (2026-11-04); the upper two levels hold
 // bare page numbers. 0 = not mapped. With `write` only writable pages.
 uint32_t RDNA4PvHost::guestPfn(uint32_t task, uint64_t va, bool write) {
-	const unsigned index[4] = {0, static_cast<unsigned>(va >> 32) & 1023, static_cast<unsigned>(va >> 22) & 1023, static_cast<unsigned>(va >> 12) & 1023};
+	if (!PvGuestMemory::fitsGuestAddressSpace(va, 1))
+		return 0;
+	const unsigned index[4] = {0, static_cast<unsigned>(va >> 32), static_cast<unsigned>(va >> 22) & 1023, static_cast<unsigned>(va >> 12) & 1023};
 	uint32_t pfn = mTaskRoot[task & 63];
 	for (unsigned level = 0; level < 4 && pfn; level++)
 		pfn = tableEntry(pfn, index[level]);
@@ -5478,7 +5480,7 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 	// the cache (256) finding none of them again.
 	static constexpr uint64_t kWindow = 2ull << 20;
 	PvGuestMemory::PageRange range {};
-	if (!PvGuestMemory::makePageRange(va, bytes, range))
+	if (!PvGuestMemory::fitsGuestAddressSpace(va, bytes) || !PvGuestMemory::makePageRange(va, bytes, range))
 		return false;
 
 	if (PvGuestMemory::fitsWindow(range, bytes, kWindow / 4)) {
