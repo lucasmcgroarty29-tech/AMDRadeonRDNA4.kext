@@ -1,6 +1,7 @@
 // Host test of src/pvstream.cpp: the three layers' framing and the generated opcode tables (docs/m1-stream.md).
 #include "../src/pvstream.hpp"
 #include "../src/pvscanout.hpp"
+#include "../src/pvguestmemory.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,24 @@ static void sink(void *u, uint32_t id, const char *name, const uint8_t *, uint32
 }
 
 int main() {
+	// Guest VA page-range arithmetic: avoid wrapping at the top of the address space.
+	{
+		PvGuestMemory::PageRange range {};
+		CHECK(PvGuestMemory::makePageRange(0x1234, 1, range));
+		CHECK(range.first == 0x1000 && range.count == 1 && range.window == 0 && range.windowOffset == 0x1234);
+		CHECK(PvGuestMemory::makePageRange(0x1ff0, 0x30, range));
+		CHECK(range.first == 0x1000 && range.count == 2);
+		CHECK(PvGuestMemory::fitsWindow(range, 0x30, (2ull << 20) / 4));
+		CHECK(PvGuestMemory::makePageRange((1ull << 21) - 16, 16, range));
+		CHECK(PvGuestMemory::fitsWindow(range, 16, (2ull << 20) / 4));
+		CHECK(PvGuestMemory::makePageRange((1ull << 21) - 16, 17, range));
+		CHECK(!PvGuestMemory::fitsWindow(range, 17, (2ull << 20) / 4)); // crosses the 2 MiB window
+		CHECK(!PvGuestMemory::makePageRange(UINT64_MAX - 3, 8, range)); // end wraps
+		CHECK(PvGuestMemory::makePageRange(UINT64_MAX, 1, range)); // last byte itself is representable
+		CHECK(range.first == (UINT64_MAX & ~0xfffull) && range.count == 1);
+		CHECK(!PvGuestMemory::makePageRange(0, 0, range));
+	}
+
 	// IOSurface-to-scanout layout validation: exact bounds, clipping and overflow-safe final-row checks.
 	{
 		PvScanout::CopyLayout layout {};
