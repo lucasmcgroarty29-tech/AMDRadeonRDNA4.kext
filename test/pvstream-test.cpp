@@ -28,6 +28,9 @@ int main() {
 		CHECK(layout.width == 1920 && layout.height == 1080 && layout.rowBytes == 7680);
 		CHECK(PvScanout::makeCopyLayout(64, 8192, 4096, 2, 2048, 1024, 4, layout));
 		CHECK(layout.width == 512 && layout.height == 2 && layout.rowBytes == 2048);
+		// The last copied byte may be exactly the descriptor's last byte.
+		CHECK(PvScanout::makeCopyLayout(64, 6208, 4096, 2, 2048, 512, 2, layout));
+		CHECK(!PvScanout::makeCopyLayout(64, 6207, 4096, 2, 2048, 512, 2, layout)); // one byte short
 		CHECK(!PvScanout::makeCopyLayout(8193, 8192, 4096, 2, 4096, 1024, 2, layout)); // base beyond descriptor
 		CHECK(!PvScanout::makeCopyLayout(0, 8191, 4096, 2, 4096, 1024, 2, layout));  // final row truncated
 		CHECK(!PvScanout::makeCopyLayout(0, 8192, 0, 2, 4096, 1024, 2, layout));     // zero source stride
