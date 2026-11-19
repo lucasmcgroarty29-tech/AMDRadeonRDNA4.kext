@@ -8132,15 +8132,15 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	// larger than the head both ways: a scaled mode's frame, scaled down into the scanout (else the head's part of it is copied)
 	const bool scaled = frameW > h.width && frameH > h.height && bpr / 4 >= frameW && scaleKernel();
 	const uint32_t height = scaled ? frameH : md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
-	uint64_t handle = 0, src = 0;
+	uint64_t handle = 0, src = 0, sourceBytes = 0;
 	const CardSurface *card = cardSurface(s);
-	bool ok = md && width && height && base + bpr * height <= md->getLength();
+	bool ok = md && width && height && PvScanout::makeSurfaceRange(base, md->getLength(), bpr, height, sourceBytes);
 
 	if (ok && card && card->loaded && card->base == base) {   // the frame on the card already
 		src = card->gpu;
 	}
 	else if (ok && md->prepare() == kIOReturnSuccess) {
-		ok = mapMemory(md, base, bpr * height, handle, src);
+		ok = mapMemory(md, base, sourceBytes, handle, src);
 		md->complete();
 	}
 	else {
