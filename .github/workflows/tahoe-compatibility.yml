@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - tahoe-26.7.3-compat-audit
+      - fix/tahoe-144hz-display-pacing
   pull_request:
     branches:
       - main
