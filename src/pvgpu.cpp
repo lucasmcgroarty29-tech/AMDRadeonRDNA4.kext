@@ -112,9 +112,16 @@ uint8_t *gPhysmap { nullptr }, *gPhysmapEnd { nullptr };
 // Physical memory at `pa` for `bytes` through the physmap, or nullptr without one or past its end.
 static uint8_t *physPtr(uint64_t pa, uint64_t bytes)
 {
-	const uint64_t mapped = static_cast<uint64_t>(gPhysmapEnd - gPhysmap);
+	if (!gPhysmap || !gPhysmapEnd)
+		return nullptr;
 
-	if (!gPhysmap || pa + bytes < pa || pa + bytes > mapped)
+	const uintptr_t base = reinterpret_cast<uintptr_t>(gPhysmap);
+	const uintptr_t end = reinterpret_cast<uintptr_t>(gPhysmapEnd);
+	if (end < base)
+		return nullptr;
+
+	const uint64_t mapped = static_cast<uint64_t>(end - base);
+	if (!PvGuestMemory::fitsRange(pa, bytes, mapped))
 		return nullptr;
 
 	return gPhysmap + pa;
@@ -5582,7 +5589,7 @@ bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, b
 // The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
 bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
 	PvGuestMemory::PageRange range {};
-	if (!memory || !PvGuestMemory::fitsDescriptor(offset, bytes, memory->getLength()) ||
+	if (!memory || !PvGuestMemory::fitsRange(offset, bytes, memory->getLength()) ||
 	    !PvGuestMemory::makePageRange(offset, bytes, range))
 		return false;
 	const uint64_t first = range.first, count = range.count;
