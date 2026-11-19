@@ -1226,10 +1226,12 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		h->mDisp = kDispOnline | kDispVbl;   // the heads are the displays: they are there, and WindowServer paces on their VBL
 	uint32_t refreshMilliHz = 60000;
 	if (Trial::option("rdna4-pvgpu-millihz", refreshMilliHz)) {
-		if (refreshMilliHz >= 24000 && refreshMilliHz <= 240000)
+		if (refreshMilliHz >= 24000 && refreshMilliHz <= 240000) {
 			h->mVblPeriodNs = 1000000000000ull / refreshMilliHz;
-		else
+			h->mDispInfo.modes[0].refresh = static_cast<uint32_t>((static_cast<uint64_t>(refreshMilliHz) * 65536 + 500) / 1000);
+		} else {
 			pvlog("host: rdna4-pvgpu-millihz %u ignored (24000..240000)", refreshMilliHz);
+		}
 	}
 	uint32_t w = 0, ht = 0;
 	(void)Trial::option("rdna4-pvgpu-width", w);
