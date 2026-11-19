@@ -38,13 +38,15 @@ int main() {
 		CHECK(PvGuestMemory::makePageRange(UINT64_MAX, 1, range)); // last byte itself is representable
 		CHECK(range.first == (UINT64_MAX & ~0xfffull) && range.count == 1);
 		CHECK(!PvGuestMemory::makePageRange(0, 0, range));
-		CHECK(PvGuestMemory::fitsDescriptor(0, 4096, 4096));
-		CHECK(PvGuestMemory::fitsDescriptor(4095, 1, 4096));
-		CHECK(!PvGuestMemory::fitsDescriptor(4095, 2, 4096));
-		CHECK(!PvGuestMemory::fitsDescriptor(4097, 1, 4096));
-		CHECK(!PvGuestMemory::fitsDescriptor(0, 0, 4096));
-		CHECK(PvGuestMemory::fitsDescriptor(UINT64_MAX - 7, 7, UINT64_MAX));
-		CHECK(!PvGuestMemory::fitsDescriptor(UINT64_MAX - 7, 8, UINT64_MAX));
+		CHECK(PvGuestMemory::fitsRange(0, 4096, 4096));
+		CHECK(PvGuestMemory::fitsRange(4095, 1, 4096));
+		CHECK(!PvGuestMemory::fitsRange(4095, 2, 4096));
+		CHECK(!PvGuestMemory::fitsRange(4097, 1, 4096));
+		CHECK(PvGuestMemory::fitsRange(0, 0, 4096));
+		CHECK(PvGuestMemory::fitsRange(4096, 0, 4096));
+		CHECK(!PvGuestMemory::fitsRange(4097, 0, 4096));
+		CHECK(PvGuestMemory::fitsRange(UINT64_MAX - 7, 7, UINT64_MAX));
+		CHECK(!PvGuestMemory::fitsRange(UINT64_MAX - 7, 8, UINT64_MAX));
 	}
 
 	// Head identity compares semantic fields, not unspecified struct padding.
