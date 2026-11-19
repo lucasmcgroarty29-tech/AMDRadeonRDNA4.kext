@@ -103,7 +103,7 @@ uint8_t *scanout(uint32_t port, PvScanout::Head &head)
 	Mapping &m = gMap[port];
 	const uint64_t bytes = static_cast<uint64_t>(head.pitch) * head.height;
 
-	if (m.map && !memcmp(&m.head, &head, sizeof(head)))
+	if (m.map && PvScanout::sameHead(m.head, head))
 		return reinterpret_cast<uint8_t *>(m.map->getVirtualAddress());
 
 	unmap(m);

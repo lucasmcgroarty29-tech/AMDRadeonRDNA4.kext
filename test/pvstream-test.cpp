@@ -1,5 +1,7 @@
 // Host test of src/pvstream.cpp: the three layers' framing and the generated opcode tables (docs/m1-stream.md).
 #include "../src/pvstream.hpp"
+#include "../src/pvscanout.hpp"
+#include "../src/pvguestmemory.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -20,6 +22,95 @@ static void sink(void *u, uint32_t id, const char *name, const uint8_t *, uint32
 }
 
 int main() {
+	// Guest VA page-range arithmetic: avoid wrapping at the top of the address space.
+	{
+		PvGuestMemory::PageRange range {};
+		CHECK(PvGuestMemory::makePageRange(0x1234, 1, range));
+		CHECK(range.first == 0x1000 && range.count == 1 && range.window == 0 && range.windowOffset == 0x1234);
+		CHECK(PvGuestMemory::makePageRange(0x1ff0, 0x30, range));
+		CHECK(range.first == 0x1000 && range.count == 2);
+		CHECK(PvGuestMemory::fitsWindow(range, 0x30, (2ull << 20) / 4));
+		CHECK(PvGuestMemory::makePageRange((1ull << 21) - 16, 16, range));
+		CHECK(PvGuestMemory::fitsWindow(range, 16, (2ull << 20) / 4));
+		CHECK(PvGuestMemory::makePageRange((1ull << 21) - 16, 17, range));
+		CHECK(!PvGuestMemory::fitsWindow(range, 17, (2ull << 20) / 4)); // crosses the 2 MiB window
+		CHECK(!PvGuestMemory::makePageRange(UINT64_MAX - 3, 8, range)); // end wraps
+		CHECK(PvGuestMemory::makePageRange(UINT64_MAX, 1, range)); // last byte itself is representable
+		CHECK(range.first == (UINT64_MAX & ~0xfffull) && range.count == 1);
+		CHECK(!PvGuestMemory::makePageRange(0, 0, range));
+		CHECK(PvGuestMemory::fitsRange(0, 4096, 4096));
+		CHECK(PvGuestMemory::fitsRange(4095, 1, 4096));
+		CHECK(!PvGuestMemory::fitsRange(4095, 2, 4096));
+		CHECK(!PvGuestMemory::fitsRange(4097, 1, 4096));
+		CHECK(PvGuestMemory::fitsRange(0, 0, 4096));
+		CHECK(PvGuestMemory::fitsRange(4096, 0, 4096));
+		CHECK(!PvGuestMemory::fitsRange(4097, 0, 4096));
+		CHECK(PvGuestMemory::fitsRange(UINT64_MAX - 7, 7, UINT64_MAX));
+		CHECK(!PvGuestMemory::fitsRange(UINT64_MAX - 7, 8, UINT64_MAX));
+		CHECK(PvGuestMemory::fitsGuestAddressSpace(0, 1));
+		CHECK(PvGuestMemory::fitsGuestAddressSpace((16ull << 30) - 1, 1));
+		CHECK(PvGuestMemory::fitsGuestAddressSpace(0, 16ull << 30));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace((16ull << 30) - 1, 2));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(16ull << 30, 1));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(0, (16ull << 30) + 1));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(UINT64_MAX, 1));
+		CHECK(!PvGuestMemory::fitsGuestAddressSpace(0, 0));
+		uint64_t result = 0;
+		CHECK(PvGuestMemory::checkedAdd(1, 2, result) && result == 3);
+		CHECK(PvGuestMemory::checkedAdd(UINT64_MAX - 1, 1, result) && result == UINT64_MAX);
+		CHECK(!PvGuestMemory::checkedAdd(UINT64_MAX, 1, result));
+		CHECK(PvGuestMemory::checkedMultiply(3, 4, result) && result == 12);
+		CHECK(PvGuestMemory::checkedMultiply(UINT64_MAX / 2, 2, result) && result == (UINT64_MAX - 1));
+		CHECK(!PvGuestMemory::checkedMultiply(UINT64_MAX, 2, result));
+	}
+
+	// Head identity compares semantic fields, not unspecified struct padding.
+	{
+		PvScanout::Head a, b;
+		std::memset(&a, 0xa5, sizeof(a));
+		std::memset(&b, 0x5a, sizeof(b));
+		a.phys = b.phys = 0x12345000;
+		a.pitch = b.pitch = 7680;
+		a.width = b.width = 1920;
+		a.height = b.height = 1080;
+		CHECK(PvScanout::sameHead(a, b));
+		b.height++;
+		CHECK(!PvScanout::sameHead(a, b));
+	}
+
+	// GPU-present source extent: divide before multiplying and subtract before adding.
+	{
+		uint64_t bytes = 0;
+		CHECK(PvScanout::makeSurfaceRange(64, 64 + 4096ull * 2, 4096, 2, bytes));
+		CHECK(bytes == 8192);
+		CHECK(!PvScanout::makeSurfaceRange(64, 64 + 8191, 4096, 2, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(65, 64, 4096, 1, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, 0, 1, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, 4096, 0, bytes));
+		CHECK(!PvScanout::makeSurfaceRange(0, UINT64_MAX, UINT64_MAX, 2, bytes));
+		CHECK(PvScanout::makeSurfaceRange(UINT64_MAX - 8, UINT64_MAX, 8, 1, bytes));
+		CHECK(bytes == 8); // exact final byte of the largest representable descriptor
+		CHECK(!PvScanout::makeSurfaceRange(UINT64_MAX - 7, UINT64_MAX, 8, 1, bytes));
+	}
+
+	// IOSurface-to-scanout layout validation: exact bounds, clipping and overflow-safe final-row checks.
+	{
+		PvScanout::CopyLayout layout {};
+		CHECK(PvScanout::makeCopyLayout(0, 1920ull * 4 * 1080, 1920ull * 4, 1920, 1080, 1920u * 4, 1920, 1080, layout));
+		CHECK(layout.width == 1920 && layout.height == 1080 && layout.rowBytes == 7680);
+		CHECK(PvScanout::makeCopyLayout(64, 8192, 4096, 1024, 2, 2048, 1024, 4, layout));
+		CHECK(layout.width == 512 && layout.height == 2 && layout.rowBytes == 2048);
+		// The last copied byte may be exactly the descriptor's last byte.
+		CHECK(PvScanout::makeCopyLayout(64, 6208, 4096, 1024, 2, 2048, 512, 2, layout));
+		CHECK(!PvScanout::makeCopyLayout(64, 6207, 4096, 1024, 2, 2048, 512, 2, layout)); // one byte short
+		CHECK(!PvScanout::makeCopyLayout(8193, 8192, 4096, 1024, 2, 4096, 1024, 2, layout)); // base beyond descriptor
+		CHECK(!PvScanout::makeCopyLayout(0, 8191, 4096, 1024, 2, 4096, 1024, 2, layout));  // final row truncated
+		CHECK(!PvScanout::makeCopyLayout(0, 8192, 0, 1024, 2, 4096, 1024, 2, layout));     // zero source stride
+		CHECK(!PvScanout::makeCopyLayout(0, 8192, 4096, 1024, 2, 3, 1, 2, layout));         // destination row too narrow
+		CHECK(PvScanout::makeCopyLayout(0, 8192, 4096, 1000, 2, 4096, 1024, 2, layout));
+		CHECK(layout.width == 1000 && layout.height == 2); // padded source pitch is not logical image width
+		CHECK(!PvScanout::makeCopyLayout(UINT64_MAX - 8, UINT64_MAX, 4096, 1024, 2, 4096, 1024, 2, layout));
+	}
 	// tables: sorted, spot checks against what the disassembly showed
 	int32_t len = 0;
 	CHECK(std::strcmp(streamName(0x132, &len), "Blit.fillBuffer") == 0 && len == 24);

@@ -14,6 +14,7 @@
 #include "pvdraw.hpp"
 #include "pm4.hpp"
 #include "pvscanout.hpp"
+#include "pvguestmemory.hpp"
 #include "sku.hpp"
 #include "compute.hpp"
 #include "isa.hpp"
@@ -111,9 +112,16 @@ uint8_t *gPhysmap { nullptr }, *gPhysmapEnd { nullptr };
 // Physical memory at `pa` for `bytes` through the physmap, or nullptr without one or past its end.
 static uint8_t *physPtr(uint64_t pa, uint64_t bytes)
 {
-	const uint64_t mapped = static_cast<uint64_t>(gPhysmapEnd - gPhysmap);
+	if (!gPhysmap || !gPhysmapEnd)
+		return nullptr;
 
-	if (!gPhysmap || pa + bytes < pa || pa + bytes > mapped)
+	const uintptr_t base = reinterpret_cast<uintptr_t>(gPhysmap);
+	const uintptr_t end = reinterpret_cast<uintptr_t>(gPhysmapEnd);
+	if (end < base)
+		return nullptr;
+
+	const uint64_t mapped = static_cast<uint64_t>(end - base);
+	if (!PvGuestMemory::fitsRange(pa, bytes, mapped))
 		return nullptr;
 
 	return gPhysmap + pa;
@@ -849,10 +857,12 @@ private:
 	// still came: WindowServer took the window as drawn and showed it empty.
 	uint8_t mWin[64 * 1024] {};
 
-	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
-	// guest enabled VBL; default 2, the self-test runs with 3. rdna4-pvgpu-width / -height set the mode (default 1920x1080).
+	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = VBL events for pipes whose
+	// guest enabled VBL; default 2, the self-test runs with 3. rdna4-pvgpu-millihz sets their rate (default 60000, range 24000..240000).
+	// rdna4-pvgpu-width / -height set the mode (default 1920x1080).
 	static constexpr uint32_t kDispOnline = 1, kDispVbl = 2;
-	static constexpr uint64_t kVblPeriodNs = 16666667;
+	static constexpr uint64_t kDefaultVblPeriodNs = 16666667;
+	uint64_t mVblPeriodNs { kDefaultVblPeriodNs };
 	struct Pipe {
 		bool live { false };
 		IOMemoryDescriptor *desc { nullptr };
@@ -1222,6 +1232,16 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		h->mDisp = 3;   // the self-test plays the guest's side of the display events
 	if (PvScanout::enabled())
 		h->mDisp = kDispOnline | kDispVbl;   // the heads are the displays: they are there, and WindowServer paces on their VBL
+	uint32_t refreshMilliHz = 60000;
+	if (Trial::option("rdna4-pvgpu-millihz", refreshMilliHz)) {
+		if (refreshMilliHz >= 24000 && refreshMilliHz <= 240000) {
+			h->mVblPeriodNs = 1000000000000ull / refreshMilliHz;
+			h->mDispInfo.modes[0].refresh = static_cast<uint32_t>((static_cast<uint64_t>(refreshMilliHz) * 65536 + 500) / 1000);
+		} else {
+			pvlog("host: rdna4-pvgpu-millihz %u ignored (24000..240000)", refreshMilliHz);
+			refreshMilliHz = 60000;
+		}
+	}
 	uint32_t w = 0, ht = 0;
 	(void)Trial::option("rdna4-pvgpu-width", w);
 	(void)Trial::option("rdna4-pvgpu-height", ht);
@@ -1233,8 +1253,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 			pvlog("host: rdna4-pvgpu-width/-height %u x %u ignored (64..8192 each)", w, ht);
 		}
 	}
-	pvlog("host: display side: online event %s, VBL events %s, mode %ux%u", h->mDisp & kDispOnline ? "on" : "off", h->mDisp & kDispVbl ? "on" : "off",
-	      h->mDispInfo.modes[0].width, h->mDispInfo.modes[0].height);
+	pvlog("host: display side: online event %s, VBL events %s at %u.%03u Hz, mode %ux%u", h->mDisp & kDispOnline ? "on" : "off", h->mDisp & kDispVbl ? "on" : "off",
+	      refreshMilliHz / 1000, refreshMilliHz % 1000, h->mDispInfo.modes[0].width, h->mDispInfo.modes[0].height);
 	h->mLoop = IOWorkLoop::workLoop();
 	h->mTimer = h->mLoop ? IOTimerEventSource::timerEventSource(h, hostTick) : nullptr;
 	if (!h->mTimer || h->mLoop->addEventSource(h->mTimer) != kIOReturnSuccess) {
@@ -2730,7 +2750,9 @@ void RDNA4PvHost::dumpPage(const char *what, uint32_t pfn) {
 // may write the page: WindowServer's read-only textures (resource type 3) have entries without it (2026-11-04); the upper two levels hold
 // bare page numbers. 0 = not mapped. With `write` only writable pages.
 uint32_t RDNA4PvHost::guestPfn(uint32_t task, uint64_t va, bool write) {
-	const unsigned index[4] = {0, static_cast<unsigned>(va >> 32) & 1023, static_cast<unsigned>(va >> 22) & 1023, static_cast<unsigned>(va >> 12) & 1023};
+	if (!PvGuestMemory::fitsGuestAddressSpace(va, 1))
+		return 0;
+	const unsigned index[4] = {0, static_cast<unsigned>(va >> 32), static_cast<unsigned>(va >> 22) & 1023, static_cast<unsigned>(va >> 12) & 1023};
 	uint32_t pfn = mTaskRoot[task & 63];
 	for (unsigned level = 0; level < 4 && pfn; level++)
 		pfn = tableEntry(pfn, index[level]);
@@ -2741,6 +2763,9 @@ uint32_t RDNA4PvHost::guestPfn(uint32_t task, uint64_t va, bool write) {
 // walked to once for all of its pages (a page each would map 4 table pages: 32768 mappings for a 4K target); false if one is not mapped.
 // `writable`: whether the table lets the GPU write all of them (bit 31, as guestPfn checks for a write).
 bool RDNA4PvHost::guestPages(uint32_t task, uint64_t va, uint64_t count, uint64_t *pages, bool *writable) {
+	if (!pages || !count || (va & 0xfff) || va >= PvGuestMemory::kGuestAddressSpaceBytes ||
+	    count > ((PvGuestMemory::kGuestAddressSpaceBytes - va) >> 12))
+		return false;
 	if (writable)
 		*writable = true;
 
@@ -2801,6 +2826,10 @@ void RDNA4PvHost::dumpGuest(uint32_t task, uint64_t va, uint32_t len) {
 // M1: [va, va + len) of a task's GPU address space, page by page through its page table, copied out (or, for writeGuest, in); false at the first
 // page that is not mapped.
 bool RDNA4PvHost::copyGuest(uint32_t task, uint64_t va, uint8_t *buf, uint32_t len, bool toGuest) {
+	if (!len)
+		return true;
+	if (!buf || !PvGuestMemory::fitsGuestAddressSpace(va, len))
+		return false;
 	if (mRingWriteCount && ringWritten(task, va, len))   // a dispatch in the batch writes it: done first
 		waitDraws();
 
@@ -3248,7 +3277,7 @@ bool RDNA4PvHost::bufferRange(uint32_t task, uint32_t id, uint64_t *va, uint64_t
 	}
 	*len = desc[0];
 	*va = desc[1] << 12;
-	return desc[0] && desc[1] < (1ull << 36) && guestPfn(task, *va);
+	return PvGuestMemory::fitsGuestAddressSpace(*va, *len) && desc[1] < (1ull << 36) && guestPfn(task, *va);
 }
 
 // M2: a texture's GPU range: a type-2 resource with a 116-byte descriptor, dwords {u64 size in bytes, u32 page number of its start, ...,
@@ -3278,7 +3307,7 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 	// where in its allocation the texture starts (dwords 4-5; 0x100 for CoreAnimation's text images, measured 2026-11-05)
 	const uint64_t start = desc[4] | static_cast<uint64_t>(desc[5]) << 32;
 
-	if (start >= *len)
+	if (start >= *len || !PvGuestMemory::fitsGuestAddressSpace(*va, *len))
 		return false;
 
 	*va += start;
@@ -3298,7 +3327,7 @@ bool RDNA4PvHost::textureRange(uint32_t task, uint32_t id, uint64_t *va, uint64_
 			if (desc[j - 1] == 0x2c && desc[j] == id)
 				*format = desc[j + 1] >> 16;
 	}
-	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+	return *len && *len <= (1ull << 30) && PvGuestMemory::fitsGuestAddressSpace(*va, *len) && guestPfn(task, *va);
 }
 
 // M4: an IOSurface-backed texture (resource type 5, 56 bytes: dword 0 the IOSurface id, dword 5 the Metal pixel format << 16 | ?, dwords 6
@@ -3347,14 +3376,26 @@ bool PvScanout::copySurface(uint32_t sid, uint8_t *dst, uint32_t pitch, uint32_t
 	bool ok = false;
 	if (md) {
 		const uint64_t base = gSurfaceFns.baseOffset(s), bpr = gSurfaceFns.bytesPerRow(s);
-		if (bpr) {
-			width = width < bpr / 4 ? width : static_cast<uint32_t>(bpr / 4);
-			height = height < gSurfaceFns.height(s) ? height : gSurfaceFns.height(s);
-		}
-		if (bpr && width && height && base + bpr * height <= md->getLength() && md->prepare() == kIOReturnSuccess) {
+		CopyLayout layout {};
+		if (makeCopyLayout(base, md->getLength(), bpr, gSurfaceFns.width(s), gSurfaceFns.height(s), pitch, width, height, layout) &&
+		    md->prepare() == kIOReturnSuccess) {
+			width = layout.width;
+			height = layout.height;
+			const uint64_t rowBytes = layout.rowBytes;
 			ok = true;
-			for (uint32_t y = 0; y < height && ok; y++)
-				ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, 4ull * width) == 4ull * width;
+			/*
+			 * The common scanout case has identical source and destination pitches.
+			 * Read the whole image in one descriptor operation instead of issuing
+			 * one readBytes() call per row (1080 calls for a 1080p frame).
+			 * Keep the row path for cropped or differently-pitched surfaces.
+			 */
+			if (bpr == pitch && static_cast<uint64_t>(width) * 4 == bpr) {
+				const uint64_t bytes = bpr * height;
+				ok = md->readBytes(base, dst, bytes) == bytes;
+			} else {
+				for (uint32_t y = 0; y < height && ok; y++)
+					ok = md->readBytes(base + bpr * y, dst + static_cast<uint64_t>(pitch) * y, 4ull * width) == 4ull * width;
+			}
 			md->complete();
 		}
 	}
@@ -4267,11 +4308,14 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 			out.height = v[10];
 			out.depth = 1;
 			out.rowBytes = static_cast<uint32_t>(bpr);
-			out.va = bva + offset;
+			if (!PvGuestMemory::fitsGuestAddressSpace(bva, blen))
+				return false;
+			if (!PvGuestMemory::checkedAdd(bva, offset, out.va))
+				return false;
 			out.length = blen - offset;
 			out.imageBytes = out.length;
 
-			return true;
+			return PvGuestMemory::fitsGuestAddressSpace(out.va, out.length);
 		}
 		// Kind 8, a view (newTextureViewWithPixelFormat:textureType:levels:slices:[swizzle:]baseTexture:): {8 (0x1b with a swizzle), size, id,
 		// the texture's id, u16 pixel format, u16 texture type, u64 level, u64 levels, u64 slice, u64 slices[, u8 swizzle x 4]}. Its texture
@@ -4280,22 +4324,27 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 		const uint64_t first = v[5] | static_cast<uint64_t>(v[6]) << 32, slice = v[9] | static_cast<uint64_t>(v[10]) << 32;
 		const uint32_t swizzle = v[0] == 0x1b && have >= 56 ? v[13] : 0;
 
-		if (!view || !parent || parent == id || first + level > 15 || nesting > 1)
+		if (!view || !parent || parent == id || first > 15 || level > 15 - first || nesting > 1)
 			return false;
 		nesting++;
 		const bool ok = textureSource(task, parent, out, level + static_cast<uint32_t>(first));
 		nesting--;
 		const TextureFormat *was = textureFormat(out.format), *now = textureFormat(format);
-		if (!ok || (format && format != out.format && (!was || !now || was->bpp != now->bpp)) || slice >= out.slices)
+		if (!ok || (format && format != out.format && (!was || !now || was->bpp != now->bpp)) || slice >= out.slices ||
+		    !PvGuestMemory::fitsGuestAddressSpace(out.va, out.length))
+			return false;
+		uint64_t sliceOffset = 0, sliceVa = 0;
+		if ((slice && !out.sliceBytes) || !PvGuestMemory::checkedMultiply(slice, out.sliceBytes, sliceOffset) ||
+		    sliceOffset >= out.length || !PvGuestMemory::checkedAdd(out.va, sliceOffset, sliceVa))
 			return false;
 		if (format)
 			out.format = format;
-		out.va += slice * out.sliceBytes;
-		out.length -= slice * out.sliceBytes;
+		out.va = sliceVa;
+		out.length -= sliceOffset;
 		out.slices -= static_cast<uint32_t>(slice);
 		out.swizzle = swizzle;
 
-		return true;
+		return PvGuestMemory::fitsGuestAddressSpace(out.va, out.length);
 	}
 	if (out.type == 5) {
 		if (!surfaceRange(task, id, out.surface))
@@ -4348,12 +4397,16 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 
 	// Where in its allocation the texture starts: dwords 4-5 (CoreAnimation's text images start 0x100 into theirs). Read from the
 	// allocation's start, text came out shifted by a row and a bit, its end at its start (rdna4_pvtex, 2026-11-05).
-	const uint64_t start = (td[4] | static_cast<uint64_t>(td[5]) << 32) + (lv[0] | static_cast<uint64_t>(lv[1]) << 32);
+	uint64_t start = 0, adjustedVa = 0;
+	const uint64_t allocationOffset = td[4] | static_cast<uint64_t>(td[5]) << 32;
+	const uint64_t levelOffset = lv[0] | static_cast<uint64_t>(lv[1]) << 32;
 
-	if (start >= out.length)
+	if (!PvGuestMemory::fitsGuestAddressSpace(out.va, out.length) ||
+	    !PvGuestMemory::checkedAdd(allocationOffset, levelOffset, start) || start >= out.length ||
+	    !PvGuestMemory::checkedAdd(out.va, start, adjustedVa))
 		return false;
 
-	out.va += start;
+	out.va = adjustedVa;
 	out.length -= start;
 	// an array's slices (WindowServer's 16384x1x3 R32Float: dword 3 0x00030001, dwords 6-7 0x10000; measured 2026-11-05)
 	out.slices = td[3] >> 16 ? td[3] >> 16 : 1;
@@ -4366,7 +4419,7 @@ bool RDNA4PvHost::textureSource(uint32_t task, uint32_t id, TextureSource &out, 
 		      out.depth, td[9] | static_cast<unsigned long long>(td[10]) << 32, td[11] | static_cast<unsigned long long>(td[12]) << 32, out.rowBytes,
 		      static_cast<unsigned long long>(out.length));
 
-	return true;
+	return PvGuestMemory::fitsGuestAddressSpace(out.va, out.length);
 }
 
 // textureRange of a mipmapped texture's level (a pass's attachment level: WindowServer's glass blurs each level from the one before, Tahoe):
@@ -4389,7 +4442,7 @@ bool RDNA4PvHost::levelRange(uint32_t task, uint32_t id, uint32_t level, uint64_
 		*format = s.format;
 	if (storage)
 		*storage = 0;   // ponytail: the stats count a level's draws as shared
-	return *len && *len <= (1ull << 30) && guestPfn(task, *va);
+	return *len && *len <= (1ull << 30) && PvGuestMemory::fitsGuestAddressSpace(*va, *len) && guestPfn(task, *va);
 }
 
 // A stage's textures' levels 1-7 for a shader that samples at explicit LODs (RDNA4_MTLC_LEVEL_FIRST): each level of the guest's memory in
@@ -5445,30 +5498,32 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 	// each of kitty's draws an index buffer of its own, 4 KiB at a new address, and those were 91000 new mappings in 5 s of scrolling,
 	// the cache (256) finding none of them again.
 	static constexpr uint64_t kWindow = 2ull << 20;
-	const uint64_t window = va & ~(kWindow - 1);
+	PvGuestMemory::PageRange range {};
+	if (!PvGuestMemory::fitsGuestAddressSpace(va, bytes) || !PvGuestMemory::makePageRange(va, bytes, range))
+		return false;
 
-	if (bytes && bytes <= kWindow / 4 && va + bytes <= window + kWindow) {
-		Mapping *m = keyedMapping(nullptr, task, window, kWindow >> 12);
+	if (PvGuestMemory::fitsWindow(range, bytes, kWindow / 4)) {
+		Mapping *m = keyedMapping(nullptr, task, range.window, kWindow >> 12);
 
 		if (!m)
-			m = mapWindow(task, window);
+			m = mapWindow(task, range.window);
 
 		bool covered = m != nullptr;
+		const uint64_t firstPage = range.windowOffset >> 12;
+		const uint64_t lastPage = (range.windowOffset + bytes - 1) >> 12;
 
-		for (uint64_t p = (va - window) >> 12; covered && p <= (va + bytes - 1 - window) >> 12; p++)
+		for (uint64_t p = firstPage; covered && p <= lastPage; p++)
 			covered = m->window ? (m->present[p / 64] >> (p % 64) & 1) && (!write || (m->writes[p / 64] >> (p % 64) & 1))
 			                    : !write || m->writable;
 
 		if (covered) {
 			handle = 0;
-			gpu = m->gpu + (va - window);
+			gpu = m->gpu + range.windowOffset;
 			return true;
 		}
 	}
 
-	const uint64_t first = va & ~0xfffull;
-
-	if (!mapGuestPages(task, first, (va + bytes + 0xfff - first) >> 12, write, handle, gpu))
+	if (!mapGuestPages(task, range.first, range.count, write, handle, gpu))
 		return false;
 
 	gpu += va & 0xfff;
@@ -5554,7 +5609,11 @@ bool RDNA4PvHost::mapGuestPages(uint32_t task, uint64_t first, uint64_t count, b
 
 // The same for `bytes` of a prepared memory descriptor (an IOSurface's) from `offset`, which must be 256-byte aligned (an image's base).
 bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_t bytes, uint64_t &handle, uint64_t &gpu) {
-	const uint64_t first = offset & ~0xfffull, count = (offset + bytes + 0xfff - first) >> 12;
+	PvGuestMemory::PageRange range {};
+	if (!memory || !PvGuestMemory::fitsRange(offset, bytes, memory->getLength()) ||
+	    !PvGuestMemory::makePageRange(offset, bytes, range))
+		return false;
+	const uint64_t first = range.first, count = range.count;
 
 	if (const Mapping *m = !(offset & 0xff) ? keyedMapping(memory, 0, first, count) : nullptr) {
 		handle = 0;
@@ -5575,8 +5634,14 @@ bool RDNA4PvHost::mapMemory(IOMemoryDescriptor *memory, uint64_t offset, uint64_
 		ok = phys && !(phys & 0xfff) && length;
 
 		// physical memory breaks only at page boundaries: a segment ending inside a page ends where the descriptor does
-		for (uint64_t p = 0; ok && p < (length + 0xfff) >> 12 && i < count; p++, i++)
+		const uint64_t segmentPages = length ? (static_cast<uint64_t>(length) - 1) / 4096 + 1 : 0;
+		for (uint64_t p = 0; ok && p < segmentPages && i < count; p++, i++) {
+			if (p > (UINT64_MAX - phys) / 4096) {
+				ok = false;
+				break;
+			}
 			pages[i] = phys + (p << 12);
+		}
 	}
 
 	ok = ok && mapPages(pages, count, handle, gpu, &entry);
@@ -8019,11 +8084,11 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	const uint64_t now = nowNs();
 	const uint64_t sinceVbl = now - t.vblAt;
 
-	if (t.last && now - t.last > kVblPeriodNs * 3 / 2 && now - t.last < 4 * kVblPeriodNs)   // an animation, one frame or more missed
+	if (t.last && now - t.last > mVblPeriodNs * 3 / 2 && now - t.last < 4 * mVblPeriodNs)   // an animation, one frame or more missed
 		t.missed++;
 
 	// How smooth an animation was: the time since the last frame in VBLs (rounded), longer gaps an idle display's
-	const uint64_t gap = t.last ? (now - t.last + kVblPeriodNs / 2) / kVblPeriodNs : 0;
+	const uint64_t gap = t.last ? (now - t.last + mVblPeriodNs / 2) / mVblPeriodNs : 0;
 
 	if (gap >= 1 && gap <= 8)
 		t.gaps[gap < 4 ? gap - 1 : 3]++;
@@ -8031,7 +8096,7 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	t.last = now;
 	t.frames++;
 
-	if (t.vblAt && sinceVbl < 4 * kVblPeriodNs) {
+	if (t.vblAt && sinceVbl < 4 * mVblPeriodNs) {
 		t.vblNs += sinceVbl;
 		t.vblMaxNs = sinceVbl > t.vblMaxNs ? sinceVbl : t.vblMaxNs;
 	}
@@ -8100,20 +8165,22 @@ bool RDNA4PvHost::presentOnCard(uint32_t port, uint32_t sid)
 	}
 
 	const uint64_t base = md ? gSurfaceFns.baseOffset(s) : 0, bpr = md ? gSurfaceFns.bytesPerRow(s) : 0;
-	const uint32_t width = bpr && h.width < bpr / 4 ? h.width : static_cast<uint32_t>(bpr / 4);
+	uint32_t width = frameW < h.width ? frameW : h.width;
+	if (bpr / 4 < width)
+		width = static_cast<uint32_t>(bpr / 4);
 
 	// larger than the head both ways: a scaled mode's frame, scaled down into the scanout (else the head's part of it is copied)
 	const bool scaled = frameW > h.width && frameH > h.height && bpr / 4 >= frameW && scaleKernel();
 	const uint32_t height = scaled ? frameH : md && h.height < gSurfaceFns.height(s) ? h.height : md ? gSurfaceFns.height(s) : 0;
-	uint64_t handle = 0, src = 0;
+	uint64_t handle = 0, src = 0, sourceBytes = 0;
 	const CardSurface *card = cardSurface(s);
-	bool ok = md && width && height && base + bpr * height <= md->getLength();
+	bool ok = md && width && height && PvScanout::makeSurfaceRange(base, md->getLength(), bpr, height, sourceBytes);
 
 	if (ok && card && card->loaded && card->base == base) {   // the frame on the card already
 		src = card->gpu;
 	}
 	else if (ok && md->prepare() == kIOReturnSuccess) {
-		ok = mapMemory(md, base, bpr * height, handle, src);
+		ok = mapMemory(md, base, sourceBytes, handle, src);
 		md->complete();
 	}
 	else {
@@ -8851,17 +8918,17 @@ void RDNA4PvHost::pollDisplay() {
 	bool frame = false;
 	if (mDisp & kDispVbl) {
 		if (!mNextVblNs)
-			mNextVblNs = now + kVblPeriodNs;
+			mNextVblNs = now + mVblPeriodNs;
 		if (now >= mNextVblNs) {
 			const uint64_t late = now - mNextVblNs;
 
 			frame = true;
 			mVbls++;
-			mVblLateNs += late < 4 * kVblPeriodNs ? late : 0;
-			mVblLateMaxNs = late < 4 * kVblPeriodNs && late > mVblLateMaxNs ? late : mVblLateMaxNs;
-			mVblsLate += late >= 2000000 && late < 4 * kVblPeriodNs;
+			mVblLateNs += late < 4 * mVblPeriodNs ? late : 0;
+			mVblLateMaxNs = late < 4 * mVblPeriodNs && late > mVblLateMaxNs ? late : mVblLateMaxNs;
+			mVblsLate += late >= 2000000 && late < 4 * mVblPeriodNs;
 			// the next frame is one period after the last due time; after a long stall start over instead of firing a burst
-			mNextVblNs = now - mNextVblNs > 4 * kVblPeriodNs ? now + kVblPeriodNs : mNextVblNs + kVblPeriodNs;
+			mNextVblNs = now - mNextVblNs > 4 * mVblPeriodNs ? now + mVblPeriodNs : mNextVblNs + mVblPeriodNs;
 		}
 	}
 	uint32_t want = 0;
@@ -8929,12 +8996,12 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) || !lines) {
 		*due = 0;
 	} else {
-		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * kVblPeriodNs / lines;
+		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * mVblPeriodNs / lines;
 
 		uint64_t requested = 0, inUse = 0;
 
 		// an early wake-up (the tick runs every 250 us to 1 ms): the vblank is still to come
-		fire = *due && toBlank > kVblPeriodNs / 8;
+		fire = *due && toBlank > mVblPeriodNs / 8;
 		*due = now + toBlank;
 
 		if (fire && gCompute->rtScanoutShown(sm->hubp, requested, inUse) && inUse != mPortTiming[port].inUse) {

@@ -22,12 +22,63 @@
 namespace PvScanout
 {
 
+/*
+ * A validated, clipped IOSurface-to-scanout copy. Kept inline and free of
+ * IOKit dependencies so the exact bounds logic used by the kernel path can
+ * be exercised by the host regression tests.
+ */
+struct CopyLayout {
+	uint32_t width, height;
+	uint64_t rowBytes;
+};
+
+// The GPU-side presenter maps a complete set of source rows. Validate the
+// extent with division before multiplying, so neither pitch * rows nor
+// base + extent can wrap around the descriptor length.
+inline bool makeSurfaceRange(uint64_t base, uint64_t length, uint64_t pitch, uint32_t rows, uint64_t &bytes) {
+	if (!pitch || !rows || base > length)
+		return false;
+	const uint64_t remaining = length - base;
+	if (rows > remaining / pitch)
+		return false;
+	bytes = pitch * rows;
+	return true;
+}
+
+inline bool makeCopyLayout(uint64_t base, uint64_t length, uint64_t sourcePitch, uint32_t sourceWidth, uint32_t sourceHeight,
+                           uint32_t destinationPitch, uint32_t width, uint32_t height, CopyLayout &out) {
+	if (!sourcePitch || !sourceWidth || !destinationPitch || !sourceHeight || !width || !height)
+		return false;
+	const uint64_t pitchWidth = sourcePitch / 4;
+	const uint64_t destinationWidth = destinationPitch / 4;
+	if (width > sourceWidth)
+		width = sourceWidth;
+	if (width > pitchWidth)
+		width = static_cast<uint32_t>(pitchWidth);
+	if (width > destinationWidth)
+		width = static_cast<uint32_t>(destinationWidth);
+	if (height > sourceHeight)
+		height = sourceHeight;
+	const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
+	if (!width || !height || rowBytes > destinationPitch || base > length || rowBytes > length - base)
+		return false;
+	if (height - 1 > (length - base - rowBytes) / sourcePitch)
+		return false;
+	out = { width, height, rowBytes };
+	return true;
+}
+
 /* A head's scanout surface: 32 bits per pixel. */
 struct Head {
 	uint64_t phys;          /* physical address (the VRAM aperture) */
 	uint32_t pitch;         /* bytes per row */
 	uint32_t width, height;
 };
+
+/* Compare the defined fields, never ABI padding that may be indeterminate. */
+inline bool sameHead(const Head &a, const Head &b) {
+	return a.phys == b.phys && a.pitch == b.pitch && a.width == b.width && a.height == b.height;
+}
 
 /* At plugin start: debug.rdna4_pvheads, -1 until decided() (rdna4-iop switches IOPresentment by it). */
 void start();
