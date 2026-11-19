@@ -26,6 +26,22 @@ inline bool fitsRange(uint64_t offset, uint64_t bytes, uint64_t length)
 	return offset <= length && bytes <= length - offset;
 }
 
+inline bool checkedAdd(uint64_t a, uint64_t b, uint64_t &out)
+{
+	if (b > UINT64_MAX - a)
+		return false;
+	out = a + b;
+	return true;
+}
+
+inline bool checkedMultiply(uint64_t a, uint64_t b, uint64_t &out)
+{
+	if (a && b > UINT64_MAX / a)
+		return false;
+	out = a * b;
+	return true;
+}
+
 /* The guest page-table root exposes four top-level entries: 4 GiB each. */
 constexpr uint64_t kGuestAddressSpaceBytes = 16ull << 30;
 
