@@ -32,6 +32,19 @@ struct CopyLayout {
 	uint64_t rowBytes;
 };
 
+// The GPU-side presenter maps a complete set of source rows. Validate the
+// extent with division before multiplying, so neither pitch * rows nor
+// base + extent can wrap around the descriptor length.
+inline bool makeSurfaceRange(uint64_t base, uint64_t length, uint64_t pitch, uint32_t rows, uint64_t &bytes) {
+	if (!pitch || !rows || base > length)
+		return false;
+	const uint64_t remaining = length - base;
+	if (rows > remaining / pitch)
+		return false;
+	bytes = pitch * rows;
+	return true;
+}
+
 inline bool makeCopyLayout(uint64_t base, uint64_t length, uint64_t sourcePitch, uint32_t sourceHeight,
                            uint32_t destinationPitch, uint32_t width, uint32_t height, CopyLayout &out) {
 	if (!sourcePitch || !destinationPitch || !sourceHeight || !width || !height)
