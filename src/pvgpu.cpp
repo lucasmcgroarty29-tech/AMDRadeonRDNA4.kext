@@ -849,10 +849,12 @@ private:
 	// still came: WindowServer took the window as drawn and showed it empty.
 	uint8_t mWin[64 * 1024] {};
 
-	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = ~60 Hz VBL events for pipes whose
-	// guest enabled VBL; default 2, the self-test runs with 3. rdna4-pvgpu-width / -height set the mode (default 1920x1080).
+	// Display side. rdna4-pvgpu-disp: bit 0 = report the display online (fill the pipe's info, set the online event), bit 1 = VBL events for pipes whose
+	// guest enabled VBL; default 2, the self-test runs with 3. rdna4-pvgpu-millihz sets their rate (default 60000, range 24000..240000).
+	// rdna4-pvgpu-width / -height set the mode (default 1920x1080).
 	static constexpr uint32_t kDispOnline = 1, kDispVbl = 2;
-	static constexpr uint64_t kVblPeriodNs = 16666667;
+	static constexpr uint64_t kDefaultVblPeriodNs = 16666667;
+	uint64_t mVblPeriodNs { kDefaultVblPeriodNs };
 	struct Pipe {
 		bool live { false };
 		IOMemoryDescriptor *desc { nullptr };
@@ -1222,6 +1224,13 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 		h->mDisp = 3;   // the self-test plays the guest's side of the display events
 	if (PvScanout::enabled())
 		h->mDisp = kDispOnline | kDispVbl;   // the heads are the displays: they are there, and WindowServer paces on their VBL
+	uint32_t refreshMilliHz = 60000;
+	if (Trial::option("rdna4-pvgpu-millihz", refreshMilliHz)) {
+		if (refreshMilliHz >= 24000 && refreshMilliHz <= 240000)
+			h->mVblPeriodNs = 1000000000000ull / refreshMilliHz;
+		else
+			pvlog("host: rdna4-pvgpu-millihz %u ignored (24000..240000)", refreshMilliHz);
+	}
 	uint32_t w = 0, ht = 0;
 	(void)Trial::option("rdna4-pvgpu-width", w);
 	(void)Trial::option("rdna4-pvgpu-height", ht);
@@ -1233,8 +1242,8 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 			pvlog("host: rdna4-pvgpu-width/-height %u x %u ignored (64..8192 each)", w, ht);
 		}
 	}
-	pvlog("host: display side: online event %s, VBL events %s, mode %ux%u", h->mDisp & kDispOnline ? "on" : "off", h->mDisp & kDispVbl ? "on" : "off",
-	      h->mDispInfo.modes[0].width, h->mDispInfo.modes[0].height);
+	pvlog("host: display side: online event %s, VBL events %s at %u.%03u Hz, mode %ux%u", h->mDisp & kDispOnline ? "on" : "off", h->mDisp & kDispVbl ? "on" : "off",
+	      refreshMilliHz / 1000, refreshMilliHz % 1000, h->mDispInfo.modes[0].width, h->mDispInfo.modes[0].height);
 	h->mLoop = IOWorkLoop::workLoop();
 	h->mTimer = h->mLoop ? IOTimerEventSource::timerEventSource(h, hostTick) : nullptr;
 	if (!h->mTimer || h->mLoop->addEventSource(h->mTimer) != kIOReturnSuccess) {
@@ -8019,11 +8028,11 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	const uint64_t now = nowNs();
 	const uint64_t sinceVbl = now - t.vblAt;
 
-	if (t.last && now - t.last > kVblPeriodNs * 3 / 2 && now - t.last < 4 * kVblPeriodNs)   // an animation, one frame or more missed
+	if (t.last && now - t.last > mVblPeriodNs * 3 / 2 && now - t.last < 4 * mVblPeriodNs)   // an animation, one frame or more missed
 		t.missed++;
 
 	// How smooth an animation was: the time since the last frame in VBLs (rounded), longer gaps an idle display's
-	const uint64_t gap = t.last ? (now - t.last + kVblPeriodNs / 2) / kVblPeriodNs : 0;
+	const uint64_t gap = t.last ? (now - t.last + mVblPeriodNs / 2) / mVblPeriodNs : 0;
 
 	if (gap >= 1 && gap <= 8)
 		t.gaps[gap < 4 ? gap - 1 : 3]++;
@@ -8031,7 +8040,7 @@ void RDNA4PvHost::timePresent(PortTiming &t)
 	t.last = now;
 	t.frames++;
 
-	if (t.vblAt && sinceVbl < 4 * kVblPeriodNs) {
+	if (t.vblAt && sinceVbl < 4 * mVblPeriodNs) {
 		t.vblNs += sinceVbl;
 		t.vblMaxNs = sinceVbl > t.vblMaxNs ? sinceVbl : t.vblMaxNs;
 	}
@@ -8851,17 +8860,17 @@ void RDNA4PvHost::pollDisplay() {
 	bool frame = false;
 	if (mDisp & kDispVbl) {
 		if (!mNextVblNs)
-			mNextVblNs = now + kVblPeriodNs;
+			mNextVblNs = now + mVblPeriodNs;
 		if (now >= mNextVblNs) {
 			const uint64_t late = now - mNextVblNs;
 
 			frame = true;
 			mVbls++;
-			mVblLateNs += late < 4 * kVblPeriodNs ? late : 0;
-			mVblLateMaxNs = late < 4 * kVblPeriodNs && late > mVblLateMaxNs ? late : mVblLateMaxNs;
-			mVblsLate += late >= 2000000 && late < 4 * kVblPeriodNs;
+			mVblLateNs += late < 4 * mVblPeriodNs ? late : 0;
+			mVblLateMaxNs = late < 4 * mVblPeriodNs && late > mVblLateMaxNs ? late : mVblLateMaxNs;
+			mVblsLate += late >= 2000000 && late < 4 * mVblPeriodNs;
 			// the next frame is one period after the last due time; after a long stall start over instead of firing a burst
-			mNextVblNs = now - mNextVblNs > 4 * kVblPeriodNs ? now + kVblPeriodNs : mNextVblNs + kVblPeriodNs;
+			mNextVblNs = now - mNextVblNs > 4 * mVblPeriodNs ? now + mVblPeriodNs : mNextVblNs + mVblPeriodNs;
 		}
 	}
 	uint32_t want = 0;
@@ -8929,12 +8938,12 @@ bool RDNA4PvHost::vblDue(uint32_t port, uint64_t now, bool tick)
 	if (!sm || !sm->flips || sm->otg >= 8 || !gCompute->rtScanoutScan(sm->otg, line, lines, blankStart) || !lines) {
 		*due = 0;
 	} else {
-		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * kVblPeriodNs / lines;
+		const uint64_t toBlank = static_cast<uint64_t>((blankStart + lines - line) % lines) * mVblPeriodNs / lines;
 
 		uint64_t requested = 0, inUse = 0;
 
 		// an early wake-up (the tick runs every 250 us to 1 ms): the vblank is still to come
-		fire = *due && toBlank > kVblPeriodNs / 8;
+		fire = *due && toBlank > mVblPeriodNs / 8;
 		*due = now + toBlank;
 
 		if (fire && gCompute->rtScanoutShown(sm->hubp, requested, inUse) && inUse != mPortTiming[port].inUse) {
