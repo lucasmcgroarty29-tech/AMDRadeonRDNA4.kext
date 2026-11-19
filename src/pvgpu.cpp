@@ -1231,6 +1231,7 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 			h->mDispInfo.modes[0].refresh = static_cast<uint32_t>((static_cast<uint64_t>(refreshMilliHz) * 65536 + 500) / 1000);
 		} else {
 			pvlog("host: rdna4-pvgpu-millihz %u ignored (24000..240000)", refreshMilliHz);
+			refreshMilliHz = 60000;
 		}
 	}
 	uint32_t w = 0, ht = 0;
