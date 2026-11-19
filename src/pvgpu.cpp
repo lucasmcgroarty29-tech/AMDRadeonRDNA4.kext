@@ -14,6 +14,7 @@
 #include "pvdraw.hpp"
 #include "pm4.hpp"
 #include "pvscanout.hpp"
+#include "pvguestmemory.hpp"
 #include "sku.hpp"
 #include "compute.hpp"
 #include "isa.hpp"
@@ -5469,30 +5470,32 @@ bool RDNA4PvHost::mapGuest(uint32_t task, uint64_t va, uint64_t bytes, uint64_t 
 	// each of kitty's draws an index buffer of its own, 4 KiB at a new address, and those were 91000 new mappings in 5 s of scrolling,
 	// the cache (256) finding none of them again.
 	static constexpr uint64_t kWindow = 2ull << 20;
-	const uint64_t window = va & ~(kWindow - 1);
+	PvGuestMemory::PageRange range {};
+	if (!PvGuestMemory::makePageRange(va, bytes, range))
+		return false;
 
-	if (bytes && bytes <= kWindow / 4 && va + bytes <= window + kWindow) {
-		Mapping *m = keyedMapping(nullptr, task, window, kWindow >> 12);
+	if (PvGuestMemory::fitsWindow(range, bytes, kWindow / 4)) {
+		Mapping *m = keyedMapping(nullptr, task, range.window, kWindow >> 12);
 
 		if (!m)
-			m = mapWindow(task, window);
+			m = mapWindow(task, range.window);
 
 		bool covered = m != nullptr;
+		const uint64_t firstPage = range.windowOffset >> 12;
+		const uint64_t lastPage = (range.windowOffset + bytes - 1) >> 12;
 
-		for (uint64_t p = (va - window) >> 12; covered && p <= (va + bytes - 1 - window) >> 12; p++)
+		for (uint64_t p = firstPage; covered && p <= lastPage; p++)
 			covered = m->window ? (m->present[p / 64] >> (p % 64) & 1) && (!write || (m->writes[p / 64] >> (p % 64) & 1))
 			                    : !write || m->writable;
 
 		if (covered) {
 			handle = 0;
-			gpu = m->gpu + (va - window);
+			gpu = m->gpu + range.windowOffset;
 			return true;
 		}
 	}
 
-	const uint64_t first = va & ~0xfffull;
-
-	if (!mapGuestPages(task, first, (va + bytes + 0xfff - first) >> 12, write, handle, gpu))
+	if (!mapGuestPages(task, range.first, range.count, write, handle, gpu))
 		return false;
 
 	gpu += va & 0xfff;
