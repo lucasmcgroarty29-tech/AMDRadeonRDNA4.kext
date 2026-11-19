@@ -22,6 +22,37 @@
 namespace PvScanout
 {
 
+/*
+ * A validated, clipped IOSurface-to-scanout copy. Kept inline and free of
+ * IOKit dependencies so the exact bounds logic used by the kernel path can
+ * be exercised by the host regression tests.
+ */
+struct CopyLayout {
+	uint32_t width, height;
+	uint64_t rowBytes;
+};
+
+inline bool makeCopyLayout(uint64_t base, uint64_t length, uint64_t sourcePitch, uint32_t sourceHeight,
+                           uint32_t destinationPitch, uint32_t width, uint32_t height, CopyLayout &out) {
+	if (!sourcePitch || !destinationPitch || !sourceHeight || !width || !height)
+		return false;
+	const uint64_t sourceWidth = sourcePitch / 4;
+	const uint64_t destinationWidth = destinationPitch / 4;
+	if (width > sourceWidth)
+		width = static_cast<uint32_t>(sourceWidth);
+	if (width > destinationWidth)
+		width = static_cast<uint32_t>(destinationWidth);
+	if (height > sourceHeight)
+		height = sourceHeight;
+	const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
+	if (!width || !height || rowBytes > destinationPitch || base > length || rowBytes > length - base)
+		return false;
+	if (height - 1 > (length - base - rowBytes) / sourcePitch)
+		return false;
+	out = { width, height, rowBytes };
+	return true;
+}
+
 /* A head's scanout surface: 32 bits per pixel. */
 struct Head {
 	uint64_t phys;          /* physical address (the VRAM aperture) */
