@@ -26,6 +26,14 @@ inline bool fitsRange(uint64_t offset, uint64_t bytes, uint64_t length)
 	return offset <= length && bytes <= length - offset;
 }
 
+/* The guest page-table root exposes four top-level entries: 4 GiB each. */
+constexpr uint64_t kGuestAddressSpaceBytes = 16ull << 30;
+
+inline bool fitsGuestAddressSpace(uint64_t address, uint64_t bytes)
+{
+	return bytes && address < kGuestAddressSpaceBytes && bytes <= kGuestAddressSpaceBytes - address;
+}
+
 inline bool makePageRange(uint64_t address, uint64_t bytes, PageRange &out)
 {
 	if (!bytes || bytes - 1 > UINT64_MAX - address)
