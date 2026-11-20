@@ -623,6 +623,7 @@ private:
 	IOTimerEventSource *mTimer { nullptr };
 	IOPMDriverAssertionID mNoSleep { 0 };   // held while the heads are the displays without a wake path (start)
 	uint64_t mBusySince { 0 };           // when the guest last gave the host work (tick: the timer's pace)
+	uint32_t mBusyTickUs { 250 };       // experimental active polling interval; stable behaviour remains 250 us
 	uint32_t mPrev[24] {};
 	uint32_t mRegLines { 0 };
 	IOMemoryDescriptor *mFifoDesc { nullptr };
@@ -1244,6 +1245,15 @@ RDNA4PvHost *RDNA4PvHost::start(RDNA4PvNub *nub, uint32_t level) {
 	}
 	h->mNub = nub;
 	h->mLevel = level;
+	uint32_t busyTickUs = 250;
+	if (PE_parse_boot_argn("rdna4-pvtick-us", &busyTickUs, sizeof(busyTickUs))) {
+		if (busyTickUs < 250 || busyTickUs > 1000) {
+			pvlog("host: rdna4-pvtick-us %u ignored (allowed range 250..1000); using 250 us", busyTickUs);
+			busyTickUs = 250;
+		}
+	}
+	h->mBusyTickUs = busyTickUs;
+	pvlog("host: active polling interval %u us%s", h->mBusyTickUs, h->mBusyTickUs == 250 ? " (baseline)" : " (experimental)");
 	if (!gTr.lock)
 		gTr.lock = IOLockAlloc();   // ponytail: never freed, like the host
 	uint32_t disp = 0;
@@ -1537,10 +1547,12 @@ void RDNA4PvHost::tick() {
 		return;
 	}
 
-	// Idle every 1 ms: the first frame of an animation started up to a 5 ms tick late, its VBL events as late (they are set by the tick).
+	// The stable cadence is 250 us. The experimental branch permits a slower active cadence for A/B
+	// testing; longer intervals reduce polling overhead but can delay FIFO commands, stamps and VBL events.
+	// Idle remains 1 ms in every mode. Keep the deadline in step with the selected timeout.
 	if (now - mBusySince < kBusyNs) {
-		mTimer->setTimeoutUS(250);
-		mTickDeadlineNs = nowNs() + 250000ull;
+		mTimer->setTimeoutUS(mBusyTickUs);
+		mTickDeadlineNs = nowNs() + static_cast<uint64_t>(mBusyTickUs) * 1000ull;
 	} else {
 		mTimer->setTimeoutMS(1);
 		mTickDeadlineNs = nowNs() + 1000000ull;
