@@ -924,6 +924,7 @@ private:
 	bool           powerSleeping { false };
 	bool           resumed { false };
 	bool           resumePending { false };
+	bool           resumeQuarantined { false }; // sleep-time queue did not stop; retain old allocations until reboot
 	bool           hangRecoveryEnabled { false }; // opt in with rdna4-hang=1
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
