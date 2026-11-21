@@ -4928,6 +4928,8 @@ static int testSparseTree() {
 	{
 		const uint32_t pagesBeforeInvalid = e.sp.pages();
 		const uint64_t lastPage = GpuVm::kVaEnd - GpuVm::kPageBytes;
+		uint64_t lastPageBefore = 0;
+		const bool lastPageWasMapped = e.translate(lastPage, lastPageBefore);
 		const bool pastEnd = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, lastPage,
 		                                             GpuVm::kVaEnd + GpuVm::kPageBytes, 0x100000, false);
 		const bool physicalOverflow = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x100000,
@@ -4937,9 +4939,11 @@ static int testSparseTree() {
 		/* The final page was deliberately mapped by the top-of-VA test above.
 		 * A rejected range must preserve that existing translation, not make it
 		 * disappear; checking for an unmapped page here tested the wrong thing. */
-		f += check(!pastEnd && !physicalOverflow && !physicalMisaligned && e.sp.pages() == pagesBeforeInvalid &&
-		           e.translate(lastPage, phys) && phys == MC + 0x301000,
-		           "tree: invalid VA tail, out-of-range physical page and misaligned physical address are rejected without disturbing existing mappings");
+		f += check(lastPageWasMapped, "tree: top-of-VA fixture maps the final page before invalid-range checks");
+		f += check(!pastEnd && !physicalOverflow && !physicalMisaligned && e.sp.pages() == pagesBeforeInvalid,
+		           "tree: invalid VA tail, out-of-range physical page and misaligned physical address are rejected before allocation");
+		f += check(e.translate(lastPage, phys) && phys == lastPageBefore,
+		           "tree: rejected ranges preserve the existing final-page translation");
 	}
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
