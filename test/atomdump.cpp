@@ -4275,6 +4275,16 @@ static int testPtPages() {
 	q.init(3);
 	bool three = q.page(0, b2, off) && q.page(1, b2, off) && q.page(2, b2, off);
 	f += check(three && !q.page(3, b2, off) && q.pages() == 3 && !q.has(3), "ptpages: the quota refuses the 4th page and leaves no trace");
+	PtPages::Table misaligned;
+	FakeChunks badChunk;
+	badChunk.next = 0x1000001;
+	PtPages::Backend badBackend { fakeAllocChunk, fakeFreeChunk, &badChunk };
+	misaligned.init(PtPages::kMaxPages);
+	f += check(!misaligned.page(0, badBackend, off) && misaligned.pages() == 0 &&
+	           misaligned.chunksHeld() == 0 && badChunk.allocs == 1 && badChunk.frees == 1 &&
+	           badChunk.live == 0,
+	           "ptpages: a misaligned backend chunk is returned immediately and never recorded");
+
 	PtPages::Table r;
 	FakeChunks c3;
 	c3.failAfter = 1;
