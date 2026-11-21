@@ -2808,6 +2808,10 @@ bool RDNA4Compute::stageSdma() {
 	flushHdp();
 	trail("s4: SDMA MCU unhalt");
 	if (!sdmaStartMcus()) {
+		// At least one MCU may already have been unhalted. A failed status
+		// check does not prove that firmware left its queue context untouched.
+		// Retain the ring and DMA backing until a later proven reset.
+		quarantine("SDMA MCU firmware bring-up failure");
 		publish();
 		return false;
 	}
