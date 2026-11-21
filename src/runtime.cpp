@@ -405,8 +405,12 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
                 // (also used by amdgpu's sdma_v7_0_is_idle/wait_for_idle).
                 // Do not free the pinned bounce buffer on a halt write alone.
                 bool idle = false;
+                uint32_t status = kBad;
                 for (uint32_t us = 0; us < 100000; us++) {
-                        if (rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg)) & kSdmaIdle) {
+                        status = rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg));
+                        // An inaccessible MMIO read returns kBad (all ones).
+                        // Never mistake that sentinel for an asserted IDLE bit.
+                        if (status != kBad && (status & kSdmaIdle)) {
                                 idle = true;
                                 break;
                         }
@@ -415,7 +419,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
                 if (!idle) {
                         sdmaIdle = false;
                         resumeQuarantined = true;
-                        RLOG("quiesce: SDMA%u did not acknowledge IDLE after halt; retaining DMA backing", instance);
+                        RLOG("quiesce: SDMA%u did not acknowledge IDLE after halt (status 0x%08x); retaining DMA backing", instance, status);
                 }
         }
         if (sdmaIdle) {
@@ -4638,8 +4642,12 @@ void RDNA4Compute::powerWillSleep() {
 		wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
 		wr(IpDiscovery::HwGc, mcu, rd(IpDiscovery::HwGc, mcu) | kSdmaMcuHalt);
 		bool idle = false;
+		uint32_t status = kBad;
 		for (uint32_t us = 0; us < 100000; us++) {
-			if (rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg)) & kSdmaIdle) {
+			status = rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg));
+			// An inaccessible MMIO read returns kBad (all ones). Do not
+			// interpret that sentinel as hardware acknowledging IDLE.
+			if (status != kBad && (status & kSdmaIdle)) {
 				idle = true;
 				break;
 			}
@@ -4648,7 +4656,7 @@ void RDNA4Compute::powerWillSleep() {
 		if (!idle) {
 			sdmaIdle = false;
 			resumeQuarantined = true;
-			RLOG("power: SDMA%u did not acknowledge IDLE after halt; retaining DMA backing", instance);
+			RLOG("power: SDMA%u did not acknowledge IDLE after halt (status 0x%08x); retaining DMA backing", instance, status);
 		}
 	}
 	if (sdmaIdle) {
