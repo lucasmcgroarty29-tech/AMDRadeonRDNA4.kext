@@ -3403,6 +3403,20 @@ static int testSdmaPackets() {
 	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
 	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
+	failures += check(!r.init(mem, UINT64_MAX - 0x7full, sizeof(mem)), "sdma: overflowing GPU ring range accepted");
+	failures += check(!r.init(mem, 0x8008800000ull, sizeof(mem), 0x17607), "sdma: unaligned resume pointer accepted");
+	const uint64_t beforeBadEmits = r.wptr();
+	failures += check(!r.emit(nullptr, 1) && !r.emit(p, 0) && !r.emit(p, UINT32_MAX) &&
+	                  r.wptr() == beforeBadEmits, "sdma: invalid or overflowing packet length changed ring");
+	{
+		uint32_t rm[64];
+		Sdma::Ring edge;
+		const uint64_t nearWrap = UINT64_MAX - 3;
+		ok = edge.init(rm, 0x8008800000ull, sizeof(rm), nearWrap);
+		const uint32_t one = 0xdeadbeef;
+		ok = ok && !edge.emit(&one, 1) && edge.wptr() == nearWrap;
+		failures += check(ok, "sdma: write pointer overflow rejected without modifying it");
+	}
 	// P7: a ring that RESUMES at the engine's own 64-bit pointers (a wake without power loss): the wptr continues monotonically from there and the packets
 	// land at the pointer modulo the ring size.
 	{
@@ -3413,7 +3427,8 @@ static int testSdmaPackets() {
 		ok = ok && rr.emit(p, Sdma::writeDword(p, a, 0x77)) && rr.wptr() == start + 5 * 4;
 		failures += check(ok && rm[(start & 255) / 4] == p[0] && rr.wptr() > start,
 		                  "sdma: ring resumed at the engine's pointers (wptr 0x%llx)", static_cast<unsigned long long>(rr.wptr()));
-		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
+		failures += check(!rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == start + 5 * 4,
+		                  "sdma: unaligned resume pointer rejected without changing the live ring");
 	}
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR/INDIRECT encodings and ring wrap %s\n",
