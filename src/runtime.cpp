@@ -4569,7 +4569,24 @@ void RDNA4Compute::powerWillSleep() {
 void RDNA4Compute::resetRuntimeForResume() {
 	if (!rtLock)
 		return;
+	// A successful queue drain is not a GPU reset. Before releasing any old
+	// page-table or buffer backing, disable every client VM context and obtain
+	// an invalidate acknowledgement for every VMID. This is the hardware
+	// proof that stale translations cannot outlive the allocations below.
+	gcWake(0xfffffffdu);
 	Locked g(rtLock);
+	for (uint32_t vmid = 1; vmid < 16; vmid++) {
+		const Reg context { 0, GcCtx1Cntl.dword + vmid - 1 };
+		wr(IpDiscovery::HwGc, context, 0);
+		if (rdGc(context) != 0 || !vmInvalidate(vmid, "resume context disable")) {
+			resumeQuarantined = true;
+			for (RtClient &client : clients)
+				if (client.active)
+					client.mapQuarantined = client.aborted = true;
+			RLOG("power: VMID %u context disable/invalidate was not acknowledged; retaining all old runtime allocations", vmid);
+			return;
+		}
+	}
 	for (RtBuffer &b : buffers) {
 		if (!b.owner)
 			continue;
@@ -4608,7 +4625,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 		c.gfxFenceMc = 0;
 		c.gfxOutstanding = 0;
 		c.gfxQuarantined = false;
-		c.mapQuarantined = false;   // GPU reset discarded the old page tables and all stale translations
+		c.mapQuarantined = false;   // every old VM context was disabled and its TLB invalidate acknowledged above
 	}
 	bzero(vmidUsed, sizeof(vmidUsed));
 	bzero(queueUsed, sizeof(queueUsed));
@@ -4633,7 +4650,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 	rtWedged = false;
 	rtReady = false;
 	rtGeneration++;
-	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
+	RLOG("power: old runtime buffers, heaps and VM contexts discarded after all VMID invalidations acknowledged; client objects retained as aborted");
 }
 
 // ---------------------------------------------------------------------------
