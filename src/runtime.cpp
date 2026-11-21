@@ -395,6 +395,11 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
 }
 
 void RDNA4Compute::publishRuntime(uint32_t stage) {
+	if (resumeQuarantined) {
+		RLOG("not published: sleep-time GPU queue did not quiesce; old runtime allocations remain quarantined until reboot");
+		publishResult("runtime", "FAIL wake queue not quiesced; allocations retained");
+		return;
+	}
 	if (!initRuntimeHeap()) {
 		RLOG("not published: %s", !rtLock ? "no lock" : "no room for a heap in the pool");
 		publishResult("runtime", "FAIL runtime heap");
@@ -4508,15 +4513,23 @@ void RDNA4Compute::powerWillSleep() {
 			RLOG("power: HQD %u/%u VMID %u timed out; invoking W6 recovery", pipe, queue, vmid);
 			inactive = recoverComputeQueue("sleep", recovery);
 		}
-		if (!inactive)
-			RLOG("power: HQD %u/%u VMID %u did not drain within the bound", pipe, queue, vmid);
+		if (!inactive) {
+			RLOG("power: HQD %u/%u VMID %u did not drain within the bound; wake allocations will be retained", pipe, queue, vmid);
+			resumeQuarantined = true;
+		}
 		grbmSelect(0, 0, 0, 0);
 		return inactive;
 	};
 	(void)drainQueue(0, 0, 0, nullptr);
 	/* rdna4-vmshared: the shared queues are the only HQDs the clients use; they are re-created at the next open after the wake. */
-	if (vmShared && sharedInit)
+	if (vmShared && sharedInit) {
 		sharedStopAll("system sleep");
+		for (const SharedQueue &q : sharedQ)
+			if (q.wedged) {
+				RLOG("power: shared compute queue failed to stop; wake allocations will be retained");
+				resumeQuarantined = true;
+			}
+	}
 	for (RtClient &c : clients) {
 		if (!c.active || !c.vmid || c.shared)
 			continue;
@@ -4542,6 +4555,11 @@ void RDNA4Compute::powerWillSleep() {
 	// IH DCN teardown is the hook that stops its vblank/pflip activity.
 	RLOG("power: IH disabled, flip timer hook stopped");
 	gfxSleepDrain();            // P7: give client gfx IBs 100 ms, then drop them (no wedge), BEFORE PFP/ME are halted
+	for (const RtClient &c : clients)
+		if (c.gfxQuarantined) {
+			RLOG("power: graphics work remains quarantined for VMID %u; wake allocations will be retained", c.vmid);
+			resumeQuarantined = true;
+		}
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
 	dmaTeardown("system sleep");
