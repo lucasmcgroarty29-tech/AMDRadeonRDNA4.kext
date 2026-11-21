@@ -4192,6 +4192,20 @@ static int testVmidPool() {
 	f += check(pool.grab(15, 0x15000, 0, g) == Result::Ok && g.stolen && g.vmid != 8,
 	           "vmid: the 15th owner steals an idle VMID; the reserved one stays out");
 
+	// An invalidate timeout makes a VMID unsafe to hand to another address space. It is
+	// retired like a pin, but unlike an ordinary pin it has no owner and cannot be reused.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok, "vmid quarantine: initial allocation");
+	const uint32_t retired = g.vmid;
+	pool.quarantine(retired);
+	f += check(pool.ownerOf(retired) == 0 && pool.pinned(retired) &&
+	           pool.grab(2, 0x2000, 0, g) == Result::Ok && g.vmid != retired,
+	           "vmid quarantine: retired VMID is ownerless and never reallocated");
+	pool.unbindAll();
+	f += check(!pool.pinned(retired) && pool.grab(3, 0x3000, 0, g) == Result::Ok,
+	           "vmid quarantine: a GPU reset clears retired VMIDs");
+
 	// unbindAll (wake / GPU reset): nothing is bound any more, pins included.
 	pool.unbindAll();
 	bool none = true;
