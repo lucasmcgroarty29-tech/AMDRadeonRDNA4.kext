@@ -4285,6 +4285,20 @@ static int testPtPages() {
 	           badChunk.live == 0,
 	           "ptpages: a misaligned backend chunk is returned immediately and never recorded");
 
+	PtPages::Table overlap;
+	FakeChunks duplicateChunk;
+	PtPages::Backend duplicateBackend { fakeAllocChunk, fakeFreeChunk, &duplicateChunk };
+	overlap.init(PtPages::kMaxPages);
+	bool firstChunk = true;
+	for (uint32_t i = 0; i < PtPages::kChunkPages; i++)
+		firstChunk &= overlap.page(i, duplicateBackend, off);
+	duplicateChunk.next = 0x1000000;  // malicious allocator returns the already-live chunk again
+	f += check(firstChunk && !overlap.page(PtPages::kChunkPages, duplicateBackend, off) &&
+	           overlap.pages() == PtPages::kChunkPages && overlap.chunksHeld() == 1 &&
+	           duplicateChunk.live == 1 && duplicateChunk.frees == 1,
+	           "ptpages: an overlapping allocator result is freed without aliasing a live page-table chunk");
+	overlap.release(duplicateBackend);
+
 	PtPages::Table r;
 	FakeChunks c3;
 	c3.failAfter = 1;
