@@ -4778,13 +4778,21 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 // One COPY_LINEAR between VRAM and the bounce buffer, through the AGP
 // aperture (bus address b is MC agpStart + b).
 bool RDNA4Compute::bounceCopy(uint64_t vram, uint32_t hostOffset, uint32_t bytes, bool toGpu) {
-	if (!bytes || hostOffset > kBounceBytes || bytes > kBounceBytes - hostOffset)
+	constexpr uint32_t kPiece = 4u << 20;
+	if (!bytes || hostOffset > kBounceBytes || bytes > kBounceBytes - hostOffset ||
+	    vram > UINT64_MAX - (static_cast<uint64_t>(bytes) - 1))
 		return false;
 	const uint64_t host = agpStart + bounceBus + hostOffset;
-	uint32_t pkt[Sdma::kCopyDwords];
-	if (Sdma::copyLinear(pkt, toGpu ? host : vram, toGpu ? vram : host, bytes) != Sdma::kCopyDwords)
-		return false;
-	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+	for (uint32_t at = 0; at < bytes;) {
+		const uint32_t n = bytes - at < kPiece ? bytes - at : kPiece;
+		const uint64_t hostAt = host + at, vramAt = vram + at;
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (Sdma::copyLinear(pkt, toGpu ? hostAt : vramAt, toGpu ? vramAt : hostAt, n) != Sdma::kCopyDwords ||
+		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000))
+			return false;
+		at += n;
+	}
+	return true;
 }
 
 // Extend the AGP aperture (and the system aperture over it, as dmaInit sets them) to reach bus address busEnd - 1, in whole GiB. amdgpu sizes it
@@ -4822,18 +4830,20 @@ bool RDNA4Compute::agpReach(uint64_t busEnd) {
 // A buffer's VRAM before it goes to its owner: the last one's data must not reach the next. CONST_FILL in pieces of 64 MiB, well
 // within the packet's byte count.
 bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
-	constexpr uint64_t kPiece = 64ull << 20;
+	// SDMA 7's documented buffer-function limit is 4 MiB per packet.
+	constexpr uint64_t kPiece = 4ull << 20;
 
-	if (!dmaReady || (bytes & 3))
+	if (!dmaReady || !bytes || (bytes & 3) || mc > UINT64_MAX - (bytes - 1))
 		return false;
 
-	for (uint64_t at = 0; at < bytes; at += kPiece) {
+	for (uint64_t at = 0; at < bytes;) {
 		const uint32_t n = static_cast<uint32_t>(bytes - at < kPiece ? bytes - at : kPiece);
 		uint32_t pkt[Sdma::kFillDwords];
 
 		if (Sdma::constFill(pkt, mc + at, 0, n) != Sdma::kFillDwords ||
 		    !sdmaRun(pkt, Sdma::kFillDwords, 2000))
 			return false;
+		at += n;
 	}
 
 	return true;
@@ -4842,23 +4852,38 @@ bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
 // M2: one CONST_FILL / COPY_LINEAR on system memory by bus address (pvgpu.cpp runs the fake paravirtual GPU's blits with these).
 bool RDNA4Compute::sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes) {
 	Locked g(rtLock);
+	constexpr uint32_t kPiece = 4u << 20;
 	if (!bytes || bus > UINT64_MAX - bytes || !agpReach(bus + bytes))
 		return false;
-	uint32_t pkt[Sdma::kFillDwords];
-	if (Sdma::constFill(pkt, agpStart + bus, pattern, bytes) != Sdma::kFillDwords)
-		return false;
-	return sdmaRun(pkt, Sdma::kFillDwords, 2000);
+	const uint64_t base = agpStart + bus;
+	for (uint32_t at = 0; at < bytes;) {
+		const uint32_t n = bytes - at < kPiece ? bytes - at : kPiece;
+		uint32_t pkt[Sdma::kFillDwords];
+		if (Sdma::constFill(pkt, base + at, pattern, n) != Sdma::kFillDwords ||
+		    !sdmaRun(pkt, Sdma::kFillDwords, 2000))
+			return false;
+		at += n;
+	}
+	return true;
 }
 
 bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
 	Locked g(rtLock);
+	constexpr uint32_t kPiece = 4u << 20;
 	if (!bytes || srcBus > UINT64_MAX - bytes || dstBus > UINT64_MAX - bytes ||
 	    !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
 		return false;
-	uint32_t pkt[Sdma::kCopyDwords];
-	if (Sdma::copyLinear(pkt, agpStart + srcBus, agpStart + dstBus, bytes) != Sdma::kCopyDwords)
-		return false;
-	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+	const uint64_t src = agpStart + srcBus;
+	const uint64_t dst = agpStart + dstBus;
+	for (uint32_t at = 0; at < bytes;) {
+		const uint32_t n = bytes - at < kPiece ? bytes - at : kPiece;
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (Sdma::copyLinear(pkt, src + at, dst + at, n) != Sdma::kCopyDwords ||
+		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000))
+			return false;
+		at += n;
+	}
+	return true;
 }
 
 bool RDNA4Compute::dmaInit() {
