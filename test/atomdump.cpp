@@ -4481,7 +4481,7 @@ struct Pair {
 	void setFailSync(bool f) { ref.failSync = nw.failSync = f; }
 
 	// After one operation: same result, same syncs, same bytes.
-	void compare(const char *what, bool rr, bool rn) {
+	void compare(const char *what, bool rr, bool rn, bool compareState = true) {
 		ops++;
 		auto fail = [&](const char *why) {
 			if (failures < 5)
@@ -4490,16 +4490,22 @@ struct Pair {
 		};
 		if (rr != rn)
 			fail("return value differs from the pre-S8 code");
-		if (ref.syncs != nw.syncs)
-			fail("the PT pages handed to vmTableSync differ");
-		if (memcmp(refWords.data(), nw.words.data(), kTableBytes) != 0) {
-			uint64_t i = 0;
-			while (refWords[i] == nw.words[i])
-				i++;
-			char buf[160];
-			snprintf(buf, sizeof(buf), "image differs at byte 0x%llx: old 0x%016llx new 0x%016llx", (unsigned long long)(i * 8),
-			         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
-			fail(buf);
+		/* Invalid host-page lists intentionally have different failure atomicity:
+		 * pre-S8 could write a valid prefix before rejecting a later bad page,
+		 * while the new implementation must leave the image untouched. Those
+		 * cases are covered by dedicated no-prefix-mutation regression tests. */
+		if (compareState) {
+			if (ref.syncs != nw.syncs)
+				fail("the PT pages handed to vmTableSync differ");
+			if (memcmp(refWords.data(), nw.words.data(), kTableBytes) != 0) {
+				uint64_t i = 0;
+				while (refWords[i] == nw.words[i])
+					i++;
+				char buf[160];
+				snprintf(buf, sizeof(buf), "image differs at byte 0x%llx: old 0x%016llx new 0x%016llx", (unsigned long long)(i * 8),
+				         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
+				fail(buf);
+			}
 		}
 		ref.syncs.clear();
 		nw.syncs.clear();
@@ -4521,7 +4527,13 @@ struct Pair {
 		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
 		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
-		compare("mapHost", a, b);
+		bool validPages = bytes && bytes <= ~0ull - (GpuVm::kPageBytes - 1);
+		const uint64_t rounded = validPages ? (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1) : 0;
+		const uint64_t pageCount = rounded / GpuVm::kPageBytes;
+		validPages = validPages && pageCount <= buses.size();
+		for (uint64_t i = 0; validPages && i < pageCount; i++)
+			validPages = !(buses[i] & (GpuVm::kPageBytes - 1)) && buses[i] <= GpuVm::kPhysicalMask;
+		compare("mapHost", a, b, validPages);
 	}
 	// The new code stops unmapping at the end of the dense image, as map() refuses past it; the pre-S8 code clears and syncs
 	// table pages beyond (0x203000 and up), so it is given only the part of the range below the end.
@@ -4904,9 +4916,12 @@ static int testSparseTree() {
 		                                                       V + 0x101000, GpuVm::kPhysicalMask + GpuVm::kPageBytes, false);
 		const bool physicalMisaligned = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x102000,
 		                                                         V + 0x103000, 0x100001, false);
+		/* The final page was deliberately mapped by the top-of-VA test above.
+		 * A rejected range must preserve that existing translation, not make it
+		 * disappear; checking for an unmapped page here tested the wrong thing. */
 		f += check(!pastEnd && !physicalOverflow && !physicalMisaligned && e.sp.pages() == pagesBeforeInvalid &&
-		           !e.translate(lastPage, phys),
-		           "tree: invalid VA tail, out-of-range physical page and misaligned physical address are rejected before allocation or mapping");
+		           e.translate(lastPage, phys) && phys == MC + 0x301000,
+		           "tree: invalid VA tail, out-of-range physical page and misaligned physical address are rejected without disturbing existing mappings");
 	}
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
