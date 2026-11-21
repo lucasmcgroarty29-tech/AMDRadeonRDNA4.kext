@@ -2694,6 +2694,15 @@ bool RDNA4Compute::stageSdma() {
 		     rdGc(sdma(0, SdmaMcuCntl)), *poolDw(kSdmaRptrOffset));
 		logGcFault("sdma");
 	};
+	// stageSdma submits directly to the ring before the runtime's fenced
+	// submission helper is available. If its completion probe times out,
+	// preserve the ring and old runtime state just like a later SDMA fence
+	// timeout; a missing write is not proof that the engine is idle.
+	auto quarantine = [this](const char *why) {
+		sdmaQuarantined = true;
+		resumeQuarantined = true;
+		RLOG("sdma: stage test could not prove queue quiescence (%s); retaining runtime backing", why);
+	};
 
 	// 1. GC hub, after the microengines' start addresses (amdgpu's order).
 	trail("s4: CP RS64 config");
@@ -2774,6 +2783,7 @@ bool RDNA4Compute::stageSdma() {
 	if (!wrote) {
 		CLOG("sdma: WRITE_LINEAR did not land (test dword 0x%08x)", *poolDw(kSdmaTestOffset));
 		status();
+		quarantine("WRITE_LINEAR completion timeout");
 		publish();
 		return false;
 	}
@@ -2803,6 +2813,7 @@ bool RDNA4Compute::stageSdma() {
 	if (!fenced) {
 		CLOG("sdma: fill fence never came (0x%08x)", *poolDw(kSdmaFenceOffset));
 		status();
+		quarantine("CONST_FILL fence timeout");
 		publish();
 		return false;
 	}
