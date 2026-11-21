@@ -592,11 +592,20 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		}
 		IOLockUnlock(self->rtLock);
 	}
-	if (!stopped && !retainOldRuntime)
+	if (!stopped && !retainOldRuntime) {
 		self->resetRuntimeForResume();
-	else if (retainOldRuntime)
-		CLOG("power: wake did not prove every GPU queue stopped; preserving old heaps, buffers, programs and page tables; compute runtime remains offline");
-	if (!stopped)
+		// resetRuntimeForResume can discover a failed context-disable or TLB
+		// acknowledgement. Do not let later bring-up stages reuse the pool
+		// while those old allocations are deliberately being retained.
+		if (self->rtLock) {
+			IOLockLock(self->rtLock);
+			retainOldRuntime = self->resumeQuarantined;
+			IOLockUnlock(self->rtLock);
+		}
+	}
+	if (retainOldRuntime)
+		CLOG("power: wake could not prove all queues and VM translations quiescent; preserving old heaps, buffers, programs and page tables; compute runtime remains offline");
+	if (!stopped && !retainOldRuntime)
 		self->runStages();
 	self->endBringup();
 	if (self->rtLock) {
