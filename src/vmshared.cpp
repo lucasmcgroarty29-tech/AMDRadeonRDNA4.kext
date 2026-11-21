@@ -40,6 +40,10 @@ bool RDNA4Compute::poolFenceReached(void *context, uint32_t domain, uint32_t seq
 // The two shared queues' homes: one per MEC pipe, queue 2 (queue 0 of pipe 0 is the boot queue, (0,1) is the boot self-test's slot). They use the
 // pool areas past the client slots (kVmQueueBase + 8 and 9 strides), so no client slot is touched.
 bool RDNA4Compute::sharedStart(uint32_t k) {
+	// A previous stop timed out. Never zero/reinitialize the ring or its
+	// fence memory while the old HQD may still be fetching from it.
+	if (resumeQuarantined)
+		return false;
 	SharedQueue &s = sharedQ[k];
 	s.pipe = k;
 	s.queue = 2;
@@ -73,6 +77,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 // Called under rtLock when the first shared client opens (and again after a resume): SH_MEM_CONFIG/BASES for every VMID, once, like
 // gfx_v12_0_constants_init, then both queues.
 bool RDNA4Compute::vmSharedEnsure() {
+	// A failed queue stop is not recoverable by simply starting it again:
+	// its old ring backing may still be GPU-reachable.
+	if (resumeQuarantined)
+		return false;
 	if (sharedInit)
 		return true;
 	rdna4Step("vmSharedEnsure: GC awake (gcEnsureAwake)");
@@ -119,10 +127,13 @@ void RDNA4Compute::sharedStopAll(const char *why) {
 		if (!idle) {
 			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x); queue remains quarantined", k, why, rdGc(CpHqdActive));
 			s.wedged = true;
+			resumeQuarantined = true;
 		}
 		grbmSelect(0, 0, 0, 0);
-		s.up = false;
-		queueUsed[s.pipe][s.queue] = false;
+		// Keep software ownership consistent with hardware. In particular,
+		// do not advertise this HQD as free after a dequeue timeout.
+		s.up = !idle;
+		queueUsed[s.pipe][s.queue] = !idle;
 	}
 	sharedInit = false;
 }
