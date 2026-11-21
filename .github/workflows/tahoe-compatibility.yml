@@ -5,6 +5,7 @@ on:
     branches:
       - tahoe-26.7.3-compat-audit
       - tahoe-26.7.3-experimental
+      - upstream-0.3.3-selective-integration
   pull_request:
     branches:
       - main

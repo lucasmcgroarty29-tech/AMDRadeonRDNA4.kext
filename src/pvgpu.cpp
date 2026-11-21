@@ -4838,7 +4838,16 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		if (talk)
 			pvlog("host: render:   %s texture %u: resource %u (type %u), format %u, %ux%ux%u, %u bytes per row, %d bytes not 0", stageName, k, id,
 			      src.type, format, w, h, depth, rowBytes, ok && fm ? inkedBytes(task, src, fm->bpp) : -1);
-		ok = ok && fm && w && h && w <= 16384 && h <= 16384 && rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
+		// A single row wider than a T# holds (16384 texels): a texture buffer, staged as rows of 16384.
+		const bool wideRow = h == 1 && depth == 1 && w > 16384 && !array1d && !array2d;
+		auto image = [&](uint32_t *t, uint64_t at, uint32_t pitchPx) {
+			if (wideRow)
+				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), 16384, (w + 16383) / 16384, 16384);
+			else
+				linearImage(t, at, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
+		};
+		ok = ok && fm && w && h && (w <= 16384 || (wideRow && w <= 16384u * 16384u)) && h <= 16384 &&
+		     rowBytes >= w * fm->bpp && static_cast<uint64_t>(rowBytes) * h <= src.length;
 		ok = ok && (depth == 1 || (depth <= 2048 && src.imageBytes >= static_cast<uint64_t>(rowBytes) * h && src.imageBytes * depth <= src.length));
 		if (!ok) {
 			if (talk || mTexLines++ < 2)   // per stats period
@@ -4881,7 +4890,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		                                   : mapGuest(task, src.va, used, out[k].handle, gpu, shaderWrites))) {
 			out[k].va = 0;   // nothing to copy back: the card writes the guest's memory itself
 			out[k].writable = false;
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, h == 1 ? w : rowBytes / fm->bpp);
+			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, h == 1 ? w : rowBytes / fm->bpp);
 			mInPlace++;
 			continue;
 		}
@@ -4897,7 +4906,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 			else if (depth > 1)
 				linearVolume(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 			else
-				linearImage(t, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, shadowPitch / fm->bpp);
+				image(t, gpu, shadowPitch / fm->bpp);
 
 			mCopied++;
 			continue;
@@ -4984,7 +4993,7 @@ bool RDNA4PvHost::stageTextures(uint32_t task, const Bindings &bound, uint32_t *
 		else if (depth > 1)
 			linearVolume(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, depth);
 		else
-			linearImage(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, fm->gfx, viewSel(fm->sel, src.swizzle), w, h, pitchPx);
+			image(table + (RDNA4_MTLC_TABLE_TEXTURES + 32 * k) / 4, gpu, pitchPx);
 	}
 	for (unsigned k = 0; k < 16 && ok; k++) {
 		const uint32_t id = bound.sampler[k];
@@ -6576,10 +6585,14 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 	// a negative height flips y).
 	// ponytail: a viewport in fractions of a pixel (vkQuake's through MoltenVK) to the nearest whole ones: up to half a pixel off
 	int64_t vx = 0, vy = 0, vw = width, vh = height;
+	int64_t qx = 0, qy = 0, qw = static_cast<int64_t>(width) << 8, qh = static_cast<int64_t>(height) << 8;
 	if (!why && draw.viewportSet &&
 	    !(roundedDouble(draw.viewport[0], vx) && roundedDouble(draw.viewport[1], vy) && roundedDouble(draw.viewport[2], vw) &&
 	      roundedDouble(draw.viewport[3], vh) && vw > 0 && vh != 0 && vw <= 32768 && vh >= -32768 && vh <= 32768 && vx > -32768 && vx < 32768 &&
 	      vy > -32768 && vy < 32768))
+		why = "a viewport too large, or empty";
+	if (!why && draw.viewportSet && !(roundedDouble(draw.viewport[0], qx, 8) && roundedDouble(draw.viewport[1], qy, 8) &&
+	                                  roundedDouble(draw.viewport[2], qw, 8) && roundedDouble(draw.viewport[3], qh, 8)))
 		why = "a viewport too large, or empty";
 	if (why) {
 		noteNotRun(why, name[2]);
@@ -6737,10 +6750,10 @@ void RDNA4PvHost::runDraw(uint32_t task, uint32_t target, uint32_t pipeline, con
 		{0x69, 0x82, (width - 1) | (height - 1) << 16},                    // PA_SC_WINDOW_SCISSOR_BR: inclusive on gfx12
 		{0x69, 0x94, sx | sy << 16},                                       // PA_SC_VPORT_SCISSOR_0_TL, _BR: Metal's scissor rectangle, BR inclusive
 		{0x69, 0x95, (sx2 - 1) | (sy2 - 1) << 16},
-		{0x69, 0x10f, halfAsFloat(static_cast<uint32_t>(vw), false)},     // PA_CL_VPORT_XSCALE: width / 2
-		{0x69, 0x110, halfAsFloat(2 * vx + vw)},                            // XOFFSET: originX + width / 2
-		{0x69, 0x111, halfAsFloat(-vh)},                                    // YSCALE: -height / 2 (Metal's y points up)
-		{0x69, 0x112, halfAsFloat(2 * vy + vh)},                            // YOFFSET: originY + height / 2
+		{0x69, 0x10f, fixedAsFloat(qw, 9)},                           // PA_CL_VPORT_XSCALE: width / 2 (1/256 pixel units, halved)
+		{0x69, 0x110, fixedAsFloat(2 * qx + qw, 9)},                      // XOFFSET: originX + width / 2
+		{0x69, 0x111, fixedAsFloat(-qh, 9)},                              // YSCALE: -height / 2 (Metal's y points up)
+		{0x69, 0x112, fixedAsFloat(2 * qy + qh, 9)},                      // YOFFSET: originY + height / 2
 		{0x79, 0x242, kPrimitive[draw.type][0]},                           // VGT_PRIMITIVE_TYPE
 		{0x79, 0x266, kPrimitive[draw.type][1]},                           // VGT_GS_OUT_PRIM_TYPE
 		{0x76, 0x31, outs ? (outs - 1) | ins << 11 : 0x400u},              // SPI_SHADER_GS_OUT_CONFIG_PS: VS_EXPORT_COUNT, NUM_INTERP; NO_PC_EXPORT
