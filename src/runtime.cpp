@@ -4835,7 +4835,7 @@ bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
 }
 
 bool RDNA4Compute::dmaInit() {
-	if (!poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
+	if (!env.pci || !env.disc || !poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
 		RLOG("dma: not set up: %s", !sdmaRing.sizeBytes() ? "no SDMA queue" : "no compute pool");
 		return false;
 	}
@@ -4864,12 +4864,30 @@ bool RDNA4Compute::dmaInit() {
 	}
 	bounceBus = seg.fIOVMAddr;
 
+	// The AGP aperture below addresses system memory by its physical bus
+	// address. agpReach() already refuses an IOMMU-translated address; apply
+	// the same rule before the initial self-test can submit any DMA.
+	const uint64_t bouncePhysical = bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+	constexpr uint64_t kDmaAddressLimit = 1ull << 40;
+	constexpr uint64_t kMcAddressLimit = 1ull << 48;
+	if (bounceBus != bouncePhysical || (bounceBus & 0xfff) ||
+	    bounceBus >= kDmaAddressLimit || kBounceBytes > kDmaAddressLimit - bounceBus ||
+	    sv.fbMcTop > UINT64_MAX - (16ull << 30)) {
+		dmaTeardown("the bounce buffer DMA address is not a directly addressable physical range");
+		return false;
+	}
+
 	// 3. amdgpu's AGP layout (amdgpu_gmc_agp_location, amdgpu_gmc_agp_addr,
 	//    gfxhub_v12_0_init_system_aperture_regs): AGP_BASE 0, the aperture
 	//    16 GiB-aligned right after the FB, bus address b at agpStart + b,
 	//    and the system aperture extended over it. It reaches bus addresses
 	//    up to the bounce buffer's end, not all of memory.
 	agpStart = (sv.fbMcTop + (16ull << 30)) & ~((16ull << 30) - 1);
+	if (agpStart >= kMcAddressLimit || bounceBus > kMcAddressLimit - agpStart ||
+	    kBounceBytes - 1 > kMcAddressLimit - agpStart - bounceBus) {
+		dmaTeardown("the AGP aperture range exceeds the GPU MC address width");
+		return false;
+	}
 	agpEnd = agpStart + bounceBus + kBounceBytes - 1;
 	wr(IpDiscovery::HwGc, GcAgpBase, 0);
 	wr(IpDiscovery::HwGc, GcAgpBot, static_cast<uint32_t>(agpStart >> 24));
