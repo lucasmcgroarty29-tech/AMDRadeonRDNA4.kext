@@ -164,6 +164,7 @@ bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page 
 	const uint64_t k = sparseKey(level, key);
 	int id = dir.find(k);
 	uint64_t heapOffset = 0, physical = 0;
+	bool physicalReady = false;
 	if (id < 0) {
 		if (!create || nextId >= kMaxPages)
 			return false;
@@ -182,13 +183,14 @@ bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page 
 		shadow[fresh] = mem;
 		nextId++;
 		markDirty(fresh);       // a new page must reach VRAM (zeros) before anything points at it
+		physicalReady = true;
 		id = static_cast<int>(fresh);
 	}
 	if (id < 0 || static_cast<uint32_t>(id) >= nextId || !shadow[id])
 		return false;
 	if (heapOffset == 0)
 		heapOffset = table.offsetOf(static_cast<uint32_t>(id));
-	if (!physical && !h.physOf(h.context, heapOffset, physical))
+	if (!physicalReady && !h.physOf(h.context, heapOffset, physical))
 		return false;
 	if ((physical & (kPageBytes - 1)) || physical > 0x0000FFFFFFFFF000ull)
 		return false;
