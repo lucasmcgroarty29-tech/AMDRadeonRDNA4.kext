@@ -3403,7 +3403,12 @@ static int testSdmaPackets() {
 	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
 	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
-	failures += check(!r.init(mem, UINT64_MAX - 0x7full, sizeof(mem)), "sdma: overflowing GPU ring range accepted");
+	{
+		uint32_t large[128];
+		Sdma::Ring overflow;
+		failures += check(!overflow.init(large, UINT64_MAX - 0xffull, sizeof(large)),
+		                  "sdma: overflowing GPU ring range accepted");
+	}
 	failures += check(!r.init(mem, 0x8008800000ull, sizeof(mem), 0x17607), "sdma: unaligned resume pointer accepted");
 	const uint64_t beforeBadEmits = r.wptr();
 	failures += check(!r.emit(nullptr, 1) && !r.emit(p, 0) && !r.emit(p, UINT32_MAX) &&
