@@ -4654,8 +4654,11 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	if (ihActive) {
 		uint64_t ns = 0;
 		const bool done = ihWaitFence(poolDw(kSdmaFenceOffset), value, timeoutMs, false, "dma", ns);
-		if (!done)
+		if (!done) {
 			RLOG("dma: SDMA queue remains wedged; this gfx12 path has no source-backed no-MES queue reset");
+			sdmaQuarantined = true;
+			resumeQuarantined = true;
+		}
 		return done;
 	}
 	uint64_t t0 = mach_absolute_time(), span = 0;
@@ -4675,6 +4678,8 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	// no source-backed no-MES queue reset sequence for this bring-up path, so a
 	// timed-out SDMA queue remains wedged rather than risking the display.
 	RLOG("dma: SDMA queue remains wedged; no source-backed no-MES queue reset");
+	sdmaQuarantined = true;
+	resumeQuarantined = true;
 	logGcFault("dma");
 	return false;
 }
@@ -4901,6 +4906,11 @@ bool RDNA4Compute::dmaInit() {
 }
 
 void RDNA4Compute::dmaTeardown(const char *why) {
+	if (sdmaQuarantined) {
+		resumeQuarantined = true;
+		RLOG("dma: teardown deferred — SDMA did not complete; retaining ring, AGP aperture, bus-master state and pinned bounce memory");
+		return;
+	}
 	RLOG("dma: off — %s; transfers stay on the CPU through the BAR", why);
 	dmaReady = false;
 	wr(IpDiscovery::HwGc, GcAgpBase, 0);
