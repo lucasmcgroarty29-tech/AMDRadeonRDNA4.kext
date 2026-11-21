@@ -4534,7 +4534,17 @@ void RDNA4Compute::powerWillSleep() {
 		return;
 	rtReady = false;
 	powerSleeping = true;
-	resumePending = false;	RLOG("power: quiesce begin (runtime not ready)");
+	resumePending = false;
+	// If any engine cannot be proven idle, retain its backing and also close
+	// the PCI bus-master gate. Keep busMasterSet as ownership bookkeeping:
+	// this quarantined instance must never restore the old DMA permission.
+	auto containBusMaster = [this]() {
+		if (env.pci && (env.pci->configRead16(kIOPCIConfigCommand) & kIOPCICommandBusMaster)) {
+			env.pci->setBusMasterEnable(false);
+			RLOG("power: PCI bus mastering disabled while GPU DMA state remains quarantined");
+		}
+	};
+	RLOG("power: quiesce begin (runtime not ready)");
 	gcWake(0xfffffffdu);
 	if (gcState == kGcHold) {
 		resumeQuarantined = true;
@@ -4542,6 +4552,7 @@ void RDNA4Compute::powerWillSleep() {
 			if (client.active)
 				client.mapQuarantined = client.aborted = true;
 		RLOG("power: GC wake failed; skipping register teardown and retaining all old runtime/DMA allocations");
+		containBusMaster();
 		return;
 	}        // P7: lift GFXOFF explicitly first (every GC access below would wake it anyway); a clean log and no sleeping GC under the drain
 	// Calls serialize on rtLock, so no dispatch or SDMA fence can still be
@@ -4614,6 +4625,8 @@ void RDNA4Compute::powerWillSleep() {
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
 	dmaTeardown("system sleep");
+	if (resumeQuarantined)
+		containBusMaster();
 	RLOG("power: quiesce complete; compute engines halted");
 }
 
