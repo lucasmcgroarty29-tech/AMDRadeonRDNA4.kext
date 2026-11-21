@@ -4506,6 +4506,10 @@ struct Pair {
 				         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
 				fail(buf);
 			}
+		} else {
+			/* Rebase the legacy oracle after an intentionally different failure
+			 * path so later fuzz operations compare from the same starting image. */
+			memcpy(refWords.data(), nw.words.data(), kTableBytes);
 		}
 		ref.syncs.clear();
 		nw.syncs.clear();
