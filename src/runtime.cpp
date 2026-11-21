@@ -374,7 +374,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         rdna4Step("quiesce: draining HQDs");
         drain(0, 0, 0);
         for (const RtClient &client : clients)
-                if (client.active)
+                if (client.active && !client.shared)
                         drain(client.pipe, client.queue, client.vmid);
         // Shared-mode clients do not own their HQDs. Their work runs on the
         // two kernel-owned VMID-0 queues, so drain those explicitly as well
