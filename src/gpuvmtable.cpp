@@ -57,7 +57,11 @@ void denseRoot(uint64_t *shadow, uint64_t rootPhys) {
 
 bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t va, uint64_t end, uint64_t physical, bool executable, Span &out) {
 	out = Span {};
-	if (end > GpuVm::kVaStart + denseVa(tableBytes))
+	if (!a.entry || !a.phys || end <= va ||
+	    ((va | end | physical) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaStart + denseVa(tableBytes) ||
+	    physical > GpuVm::kPhysicalMask ||
+	    end - va - GpuVm::kPageBytes > GpuVm::kPhysicalMask - physical)
 		return false;
 
 	for (uint64_t at = va, phys = physical; at < end;
@@ -167,6 +171,13 @@ static bool treePath(const Tree &t, uint64_t at, bool create, uint64_t *&ptEntri
 }
 
 bool treeMapVram(const Tree &t, const Policy &pol, uint64_t va, uint64_t end, uint64_t physical, bool executable) {
+	if (!t.page || !t.dirty || end <= va ||
+	    ((va | end | physical) & (GpuVm::kPageBytes - 1)) ||
+	    va < GpuVm::kVaStart || end > GpuVm::kVaEnd ||
+	    physical > GpuVm::kPhysicalMask ||
+	    end - va - GpuVm::kPageBytes > GpuVm::kPhysicalMask - physical)
+		return false;
+
 	uint64_t *pt = nullptr;
 	uint32_t ptId = 0;
 	uint64_t ptKey = ~0ull;
