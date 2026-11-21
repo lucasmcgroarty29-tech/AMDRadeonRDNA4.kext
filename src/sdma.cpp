@@ -64,12 +64,13 @@ uint32_t indirect(uint32_t *out, uint64_t buffer, uint32_t dwords, uint32_t vmid
 }
 
 bool Ring::init(volatile uint32_t *cpu, uint64_t mc, uint32_t sizeBytes, uint64_t startWptr) {
-	if (!cpu || sizeBytes < 256 || (sizeBytes & (sizeBytes - 1)) || (mc & 0xff))
+	if (!cpu || sizeBytes < 256 || (sizeBytes & (sizeBytes - 1)) || (mc & 0xff) ||
+	    mc > UINT64_MAX - (static_cast<uint64_t>(sizeBytes) - 1) || (startWptr & 3))
 		return false;
 	ring = cpu;
 	base = mc;
 	size = sizeBytes;
-	wp = startWptr & ~3ull;
+	wp = startWptr;
 	for (uint32_t i = 0; i < size / 4; i++)
 		ring[i] = 0;                     // NOPs
 	return true;
@@ -83,7 +84,10 @@ uint32_t Ring::sizeLog2Dwords() const {
 }
 
 bool Ring::emit(const uint32_t *dw, uint32_t count) {
-	if (!ring || count * 4 >= size)
+	// Compare in dwords: count * 4 can wrap before the old byte-size check.
+	// Keep one dword unused so a full ring is never confused with an empty one.
+	if (!ring || !dw || !count || count >= size / 4 ||
+	    wp > UINT64_MAX - static_cast<uint64_t>(count) * 4)
 		return false;
 	for (uint32_t i = 0; i < count; i++) {
 		ring[(wp & (size - 1)) / 4] = dw[i];
