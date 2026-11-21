@@ -812,15 +812,17 @@ bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 		return false;   // (the last: the round-up would wrap)
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
-	if (end < va)
+	if (end < va || va < GpuVm::kVaStart || end > GpuVm::kVaEnd)
 		return false;
 	if (c.sp) {
 		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		GpuVmTable::treeUnmap(tree, va, end);
 		const bool synced = sparseSync(c);
-		if (!synced)
-			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
+		if (!synced) {
+			c.mapQuarantined = c.aborted = true;
+			RLOG("vmid %u: sparse page-table unmap sync failed; client quarantined", c.vmid);
+		}
 		return synced;
 	}
 	PtCtx ctx { this, &c };
@@ -832,7 +834,8 @@ bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 	if (c.tableCpu)
 		return vmSyncCpu(c, va, end);
 	if (!vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000))) {
-		RLOG("vmid %u: page-table unmap sync failed", c.vmid);   // one SDMA job for the span, as vmMapHost
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: dense page-table unmap sync failed; client quarantined", c.vmid);
 		return false;
 	}
 	return true;
@@ -937,12 +940,18 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 /* Invalidate the VMID(s) the client's translations can be cached in: its fixed VMID, or (rdna4-vmshared=2) each VMID the pool has bound to it. A client with
  * none bound has nothing cached; its removed PTEs are caught by tlbSeq at its next grab (amdgpu's tlb_seq). */
 bool RDNA4Compute::vmInvalidateOwned(RtClient &c, const char *tag) {
-	if (vmShared != 2)
-		return vmInvalidate(c.vmid, tag);
 	bool ok = true;
-	for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++)
-		if (vmPool.ownerOf(v) == reinterpret_cast<uintptr_t>(&c))
-			ok &= vmInvalidate(v, tag);
+	if (vmShared != 2) {
+		ok = vmInvalidate(c.vmid, tag);
+	} else {
+		for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++)
+			if (vmPool.ownerOf(v) == reinterpret_cast<uintptr_t>(&c))
+				ok &= vmInvalidate(v, tag);
+	}
+	if (!ok) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("client VMID translations quarantined after invalidation failure (%s)", tag);
+	}
 	return ok;
 }
 
@@ -2962,6 +2971,10 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	 * measured on the card. When the invalidation times out the memory is never reused: the
 	 * GPU may still reach it, and host pages handed back to the kernel would take its writes. */
 	const bool invalidated = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
+	if (c && c->mapQuarantined) {
+		RLOG("vmid %u: buffer handle 0x%llx retained for reset after unmap/invalidation failure", c->vmid, handle);
+		return kIOReturnNotResponding;
+	}
 	const bool forgotten = unmapped && invalidated;
 
 	if (!forgotten)
@@ -3241,6 +3254,10 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 		 * before the VA or code allocation can be handed to another client. */
 		const bool invalidated = unmapped && vmInvalidateOwned(*c, "program unmap");
 		forgotten = unmapped && invalidated;
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: program retained for reset after unmap/invalidation failure", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		if (forgotten)
 			vaGive(*c, p->va, p->vaBytes);
 		else
@@ -4326,6 +4343,10 @@ void RDNA4Compute::rtRelease(const void *owner) {
 				unmapsSynced = vmUnmap(*c, p.va, heap.lengthOf(p.offset)) && unmapsSynced;
 			np++;
 		}
+	}
+	if (c && c->mapQuarantined) {
+		RLOG("vmid %u: client close deferred after page-table unmap failure; all allocations retained", c->vmid);
+		return;
 	}
 	/* Do not return ANY of this client's allocations until every changed page-table
 	 * range was synced and every VMID that could cache it was invalidated. This
