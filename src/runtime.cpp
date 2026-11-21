@@ -4190,6 +4190,26 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			IOSleep(1);
 		computeDone = fenceReached(*c->fenceCpu, want) || recoverSharedQueue(c->sq, c->vmid, "client close");
 	}
+	/* A private HQD must be inactive before ANY of its buffers or page tables
+	 * can be released. Previously this dequeue happened after the allocations
+	 * were returned, allowing a timed-out queue to keep writing reused memory. */
+	if (c && vmEnabled && !c->shared) {
+		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
+		grbmSelect(1, c->pipe, c->queue, c->vmid);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive)
+			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x); client allocations quarantined",
+			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
+		grbmSelect(0, 0, 0, 0);
+		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+		computeDone = inactive;
+	}
 
 	// Work that could not be ended may still read and write the client's memory: it is left allocated (and its VMID taken) rather than
 	// handed to someone else. A wedged gfx ring halted the CP, but a wave stuck in a shader still runs.
@@ -4263,21 +4283,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			else
 				wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
 		} else {
-		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
-		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
-		grbmSelect(1, c->pipe, c->queue, c->vmid);
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-		bool inactive = false;
-		for (uint32_t us = 0; us < 100000; us += 10) {
-			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
-			IODelay(10);
-		}
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!inactive)
-			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
-			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
-		grbmSelect(0, 0, 0, 0);
-		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+			/* The private HQD was already dequeued above, before any client allocation was released. */
 		}
 		if (c->sp) {
 			/* Sparse tables: zero every backed page in VRAM, then give the chunks and the wired shadow pages back. */
