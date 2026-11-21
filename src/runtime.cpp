@@ -3631,6 +3631,7 @@ void RDNA4Compute::gfxClientReset() {
 	gfxClientPending = 0;
 	for (RtClient &c : clients) {
 		c.gfxOutstanding = 0;
+		c.gfxQuarantined = false;   // a GPU reset ends the lost work; the ring and its fences are new
 		if (c.gfxFenceCpu)
 			*c.gfxFenceCpu = 0;
 		c.gfxFence = 0;
