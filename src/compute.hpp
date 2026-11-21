@@ -924,7 +924,8 @@ private:
 	bool           powerSleeping { false };
 	bool           resumed { false };
 	bool           resumePending { false };
-	bool           resumeQuarantined { false }; // sleep-time queue did not stop; retain old allocations until reboot
+	bool           resumeQuarantined { false }; // unsafe engine state; retain old runtime allocations until a proven reset
+	bool           sdmaQuarantined { false };   // SDMA fence timed out; its ring/bounce memory may still be in use
 	bool           hangRecoveryEnabled { false }; // opt in with rdna4-hang=1
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
