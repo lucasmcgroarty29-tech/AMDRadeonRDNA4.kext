@@ -116,8 +116,10 @@ void RDNA4Compute::sharedStopAll(const char *why) {
 				IODelay(10);
 		}
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!idle)
-			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x)", k, why, rdGc(CpHqdActive));
+		if (!idle) {
+			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x); queue remains quarantined", k, why, rdGc(CpHqdActive));
+			s.wedged = true;
+		}
 		grbmSelect(0, 0, 0, 0);
 		s.up = false;
 		queueUsed[s.pipe][s.queue] = false;
