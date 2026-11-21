@@ -393,6 +393,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         wr(IpDiscovery::HwGc, CpMeCntl,
            rd(IpDiscovery::HwGc, CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 
+        bool sdmaIdle = true;
         for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++) {
                 const auto rb = sdma(instance, SdmaQ0RbCntl);
                 const auto mcu = sdma(instance, SdmaMcuCntl);
@@ -400,9 +401,29 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
                    ~(kSdmaRbEnable | kSdmaRbRptrWriteback));
                 wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
                 wr(IpDiscovery::HwGc, mcu, rd(IpDiscovery::HwGc, mcu) | kSdmaMcuHalt);
+                // SDMA_STATUS_REG.IDLE is the engine's own idle indication
+                // (also used by amdgpu's sdma_v7_0_is_idle/wait_for_idle).
+                // Do not free the pinned bounce buffer on a halt write alone.
+                bool idle = false;
+                for (uint32_t us = 0; us < 100000; us++) {
+                        if (rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg)) & kSdmaIdle) {
+                                idle = true;
+                                break;
+                        }
+                        IODelay(1);
+                }
+                if (!idle) {
+                        sdmaIdle = false;
+                        resumeQuarantined = true;
+                        RLOG("quiesce: SDMA%u did not acknowledge IDLE after halt; retaining DMA backing", instance);
+                }
         }
-        wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
-           rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
+        if (sdmaIdle) {
+                wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
+                   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
+        } else {
+                RLOG("quiesce: global SDMA disable skipped because an instance did not become idle");
+        }
         if (rtLock)
                 IOLockUnlock(rtLock);
 
