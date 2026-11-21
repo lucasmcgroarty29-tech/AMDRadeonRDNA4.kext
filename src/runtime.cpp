@@ -1906,10 +1906,15 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 		return kIOReturnNoMemory;
 	}
 	c->doorbell = (0x0d + slot) * 2;
-	/* A VMID taken by a new owner is flushed before first use (amdgpu_vmid_grab
-	 * sets needs_flush, amdgpu_vm_flush emits it): no stale translations from
-	 * an earlier client or an earlier boot. A timeout is logged, not fatal. */
-	(void)vmInvalidate(vmid, "client context enable");
+	/* A new owner must not run until stale translations are gone. If the invalidate
+	 * times out, retire this VMID until reset instead of submitting into an unknown context. */
+	if (!vmInvalidate(vmid, "client context enable")) {
+		RLOG("vmid %u: initial invalidate timed out; VMID quarantined until GPU reset", vmid);
+		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
+		vmidUsed[vmid] = true;
+		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		return kIOReturnNotResponding;
+	}
 	vmidUsed[vmid] = true; queueUsed[pipe][queue] = true;
 	if (!hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd), eva >> 8, qva >> 8,
 	               rva, wva, c->doorbell)) {
@@ -2009,7 +2014,13 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	}
 	c->doorbell = sharedQ[sq].doorbell;
 	rdna4Step("rtOpenShared: TLB invalidate");
-	(void)vmInvalidate(vmid, "client context enable");
+	if (!vmInvalidate(vmid, "client context enable")) {
+		RLOG("vmid %u: initial shared-context invalidate timed out; VMID quarantined until GPU reset", vmid);
+		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
+		vmidUsed[vmid] = true;
+		IOFree(c->tableShadow, kVmTableBytes); freeTable(); *c = RtClient {};
+		return kIOReturnNotResponding;
+	}
 	rdna4Step("rtOpenShared: TLB invalidate done");
 	vmidUsed[vmid] = true;
 	c->active = true;
@@ -4244,13 +4255,17 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (!tableCleared)
 			RLOG("vmid %u: page-table teardown clear failed; retaining backing allocation to prevent stale tables being reused", c->vmid);
 		rdna4Step("rtRelease: TLB invalidate");
-		vmInvalidate(c->vmid, "client close");
+		const bool invalidated = vmInvalidate(c->vmid, "client close");
 		rdna4Step("rtRelease: done");
-		vmidUsed[c->vmid] = false;
+		/* A timed-out invalidate means this VMID may still cache translations into
+		 * the old table. Keep both the VMID and its backing allocation retired. */
+		vmidUsed[c->vmid] = !invalidated;
+		if (!invalidated)
+			RLOG("vmid %u: close invalidate timed out; VMID and page-table backing retained until GPU reset", c->vmid);
 		if (!c->shared)
 			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
-		if (tableCleared) {
+		if (tableCleared && invalidated) {
 			if (c->tableCpu)
 				heap.free(c->tableOffset);
 			else
@@ -4258,10 +4273,10 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		}
 		if (c->shared)
 			RLOG("vmid %u: shared-queue client closed, page-table backing %s", c->vmid,
-			     tableCleared ? "freed" : "retained after clear failure");
+			     tableCleared && invalidated ? "freed" : "retained after clear/invalidate failure");
 		else
 			RLOG("vmid %u: client closed, MEC1 pipe %u queue %u and page-table backing %s",
-			     c->vmid, c->pipe, c->queue, tableCleared ? "freed" : "retained after clear failure");
+			     c->vmid, c->pipe, c->queue, tableCleared && invalidated ? "freed" : "retained after clear/invalidate failure");
 		*c = RtClient {};
 	} else if (c) {
 		*c = RtClient {};
