@@ -4723,6 +4723,16 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	// earlier timed-out work stopped touching its backing memory.
 	if (sdmaQuarantined || resumeQuarantined)
 		return false;
+
+	// Preflight the whole packet + fence + trap before touching the ring.
+	// Otherwise a late emit failure could leave a partial command sequence
+	// ahead of the next submission, even though this call never kicked it.
+	const uint64_t totalDwords = static_cast<uint64_t>(dwords) + Sdma::kFenceDwords + Sdma::kTrapDwords;
+	const uint64_t ringDwords = sdmaRing.sizeBytes() / 4;
+	if (!pkt || !dwords || !ringDwords || totalDwords >= ringDwords ||
+	    sdmaRing.wptr() > UINT64_MAX - totalDwords * 4)
+		return false;
+
 	uint32_t fence[Sdma::kFenceDwords];
 	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
