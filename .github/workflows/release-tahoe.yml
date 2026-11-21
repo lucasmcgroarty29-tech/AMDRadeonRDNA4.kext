@@ -36,12 +36,12 @@ jobs:
       - name: Build standard x86_64 kext
         run: |
           make PVGPU=0
-          KEXT="Build/AMDRadeonRDNA4-0.3.1-RELEASE/AMDRadeonRDNA4.kext"
+          KEXT="Build/AMDRadeonRDNA4-0.3.4-RELEASE/AMDRadeonRDNA4.kext"
           test -d "$KEXT"
           ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXT/Contents/Info.plist")
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$KEXT/Contents/Info.plist")
           test "$ID" = "com.hackintosh.AMDRadeonRDNA4"
-          test "$VERSION" = "0.3.1"
+          test "$VERSION" = "0.3.4"
           file "$KEXT/Contents/MacOS/AMDRadeonRDNA4"
           lipo -archs "$KEXT/Contents/MacOS/AMDRadeonRDNA4" | grep -qw x86_64
           mkdir -p dist
