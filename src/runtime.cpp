@@ -4624,6 +4624,39 @@ void RDNA4Compute::powerWillSleep() {
 		}
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
+
+	// A halted CP/MEC does not establish that SDMA has finished its own
+	// outstanding work. Disable each SDMA ring and wait for the engine's
+	// IDLE indication before dmaTeardown closes the AGP aperture or releases
+	// the pinned host buffer.
+	bool sdmaIdle = true;
+	for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++) {
+		const auto rb = sdma(instance, SdmaQ0RbCntl);
+		const auto mcu = sdma(instance, SdmaMcuCntl);
+		wr(IpDiscovery::HwGc, rb, rd(IpDiscovery::HwGc, rb) &
+		   ~(kSdmaRbEnable | kSdmaRbRptrWriteback));
+		wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
+		wr(IpDiscovery::HwGc, mcu, rd(IpDiscovery::HwGc, mcu) | kSdmaMcuHalt);
+		bool idle = false;
+		for (uint32_t us = 0; us < 100000; us++) {
+			if (rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg)) & kSdmaIdle) {
+				idle = true;
+				break;
+			}
+			IODelay(1);
+		}
+		if (!idle) {
+			sdmaIdle = false;
+			resumeQuarantined = true;
+			RLOG("power: SDMA%u did not acknowledge IDLE after halt; retaining DMA backing", instance);
+		}
+	}
+	if (sdmaIdle) {
+		wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
+		   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
+	} else {
+		RLOG("power: global SDMA disable skipped because an instance did not become idle");
+	}
 	dmaTeardown("system sleep");
 	if (resumeQuarantined)
 		containBusMaster();
