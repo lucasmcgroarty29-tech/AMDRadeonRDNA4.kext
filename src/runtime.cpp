@@ -677,44 +677,62 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	    (mc & (GpuVm::kPageBytes - 1)))
 		return false;
 	uint64_t physical = 0;
-	if (!gpuPhysical(mc, physical))
+	if (!gpuPhysical(mc, physical) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
 		return false;
-	if (bytes > ~0ull - (GpuVm::kPageBytes - 1))
-		return false;   // the round-up would wrap (to a small size that passes the checks below)
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
+
 	if (c.sp) {
-		/* Sparse tables: GpuVmTable::treeMapVram creates the directories and PT pages the range needs; the pages it changed are synced. */
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		if (!GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable)) {
-			/* treeMapVram clears any prefix it installed in the shadow. Sync
-			 * that rollback too, or VRAM may retain a partial mapping. */
-			if (!sparseSync(c))
-				RLOG("vmid %u: failed to sync sparse VRAM-map rollback", c.vmid);
+			/* treeMapVram clears any prefix it installed in the shadow. That rollback
+			 * must reach VRAM too, or a partial mapping can outlive this failed call. */
+			if (!sparseSync(c)) {
+				c.mapQuarantined = c.aborted = true;
+				RLOG("vmid %u: sparse VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
+			}
 			return false;
 		}
-		return sparseSync(c);
+		if (sparseSync(c))
+			return true;
+		treeUnmap(tree, va, end);
+		if (!sparseSync(c)) {
+			c.mapQuarantined = c.aborted = true;
+			RLOG("vmid %u: sparse VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
+		}
+		return false;
 	}
-	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
+
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapVram(access, vmPolicy(), kVmTableBytes, va, end, physical, executable, span))
 		return false;
-	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
-	 * reach VRAM before the queue can walk this mapping. */
-	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
-	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
-	if (c.tableCpu)
-		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
-	return span.firstPt != ~0ull &&
-	       (!span.directories || (vmTableSync(c, 0, 0x3000) &&
-	                              vmTableSync(c, GpuVmTable::kDenseUpperPdb0, GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
-	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
-}
+	auto syncRange = [&](const GpuVmTable::Span &changed, bool directories) {
+		if (c.tableCpu)
+			return vmSyncCpu(c, va, end);
+		return (!directories || (vmTableSync(c, 0, 0x3000) &&
+		                         vmTableSync(c, GpuVmTable::kDenseUpperPdb0,
+		                                     GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
+		       changed.firstPt != ~0ull &&
+		       vmTableSync(c, static_cast<uint32_t>(changed.firstPt),
+		                   static_cast<uint32_t>(changed.lastPt - changed.firstPt + 0x1000));
+	};
+	if (syncRange(span, span.directories))
+		return true;
 
+	/* The shadow was changed even though the VRAM sync failed. Remove those PTEs
+	 * and sync the rollback before the caller is allowed to release its backing. */
+	GpuVmTable::Span rollback;
+	GpuVmTable::unmap(access, kVmTableBytes, va, end, rollback);
+	if (!syncRange(rollback, span.directories)) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: dense VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
+	}
+	return false;
+}
 bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
                              uint64_t bytes, bool executable, bool readOnly) {
 	if (!poolCpu || !hasTables(c) || !pageBuses || !bytes ||
@@ -728,29 +746,47 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		if (!GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable, readOnly)) {
-			/* Flush the rollback as well as the successful path: a prefix PTE
-			 * may already have reached VRAM before a later allocation failed. */
-			if (!sparseSync(c))
-				RLOG("vmid %u: failed to sync sparse host-map rollback", c.vmid);
+			if (!sparseSync(c)) {
+				c.mapQuarantined = c.aborted = true;
+				RLOG("vmid %u: sparse host-map rollback sync failed; client allocations quarantined", c.vmid);
+			}
 			return false;
 		}
-		return sparseSync(c);
+		if (sparseSync(c))
+			return true;
+		treeUnmap(tree, va, end);
+		if (!sparseSync(c)) {
+			c.mapQuarantined = c.aborted = true;
+			RLOG("vmid %u: sparse host-map rollback sync failed; client allocations quarantined", c.vmid);
+		}
+		return false;
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span, readOnly))
 		return false;
-	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
-	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
-	if (c.tableCpu)
-		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
-	return span.firstPt != ~0ull &&
-	       (!span.directories || (vmTableSync(c, 0, 0x3000) &&
-	                              vmTableSync(c, GpuVmTable::kDenseUpperPdb0, GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
-	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
-}
+	auto syncRange = [&](const GpuVmTable::Span &changed, bool directories) {
+		if (c.tableCpu)
+			return vmSyncCpu(c, va, end);
+		return (!directories || (vmTableSync(c, 0, 0x3000) &&
+		                         vmTableSync(c, GpuVmTable::kDenseUpperPdb0,
+		                                     GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
+		       changed.firstPt != ~0ull &&
+		       vmTableSync(c, static_cast<uint32_t>(changed.firstPt),
+		                   static_cast<uint32_t>(changed.lastPt - changed.firstPt + 0x1000));
+	};
+	if (syncRange(span, span.directories))
+		return true;
 
+	GpuVmTable::Span rollback;
+	GpuVmTable::unmap(access, kVmTableBytes, va, end, rollback);
+	if (!syncRange(rollback, span.directories)) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: dense host-map rollback sync failed; client allocations quarantined", c.vmid);
+	}
+	return false;
+}
 bool RDNA4Compute::initRuntimeHeap() {
 	if (!rtLock || !poolCpu || pool.size <= kHeapOffset)
 		return false;
