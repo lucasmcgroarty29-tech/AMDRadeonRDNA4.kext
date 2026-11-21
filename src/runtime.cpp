@@ -4575,6 +4575,14 @@ void RDNA4Compute::resetRuntimeForResume() {
 	// proof that stale translations cannot outlive the allocations below.
 	gcWake(0xfffffffdu);
 	Locked g(rtLock);
+	if (gcState == kGcHold) {
+		resumeQuarantined = true;
+		for (RtClient &client : clients)
+			if (client.active)
+				client.mapQuarantined = client.aborted = true;
+		RLOG("power: GC wake failed; retaining all old runtime allocations without touching VM registers");
+		return;
+	}
 	for (uint32_t vmid = 1; vmid < 16; vmid++) {
 		const Reg context { 0, GcCtx1Cntl.dword + vmid - 1 };
 		wr(IpDiscovery::HwGc, context, 0);
