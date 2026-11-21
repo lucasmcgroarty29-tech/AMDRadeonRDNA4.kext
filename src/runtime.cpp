@@ -376,6 +376,17 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         for (const RtClient &client : clients)
                 if (client.active)
                         drain(client.pipe, client.queue, client.vmid);
+        // Shared-mode clients do not own their HQDs. Their work runs on the
+        // two kernel-owned VMID-0 queues, so drain those explicitly as well
+        // before halting MEC or considering the DMA backing releasable.
+        if (vmShared && sharedInit) {
+                sharedStopAll("system shutdown");
+                for (const SharedQueue &queue : sharedQ)
+                        if (queue.wedged) {
+                                resumeQuarantined = true;
+                                RLOG("quiesce: shared compute queue failed to stop; retaining runtime and DMA allocations");
+                        }
+        }
         grbmSelect(0, 0, 0, 0);
         wr(IpDiscovery::HwGc, CpMecRs64Cntl,
            rd(IpDiscovery::HwGc, CpMecRs64Cntl) | kRs64Halt);
