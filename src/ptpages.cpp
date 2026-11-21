@@ -59,7 +59,16 @@ bool Table::page(uint32_t logical, const Backend &b, uint64_t &heapOffset) {
 		 * broken allocator before recording an offset that could alias pages
 		 * or wrap when a slot is added. */
 		constexpr uint64_t chunkBytes = static_cast<uint64_t>(kChunkPages) * kPageBytes;
-		if ((off & (chunkBytes - 1)) || off > ~0ull - chunkBytes) {
+		bool overlaps = false;
+		if (off <= ~0ull - chunkBytes) {
+			for (uint32_t i = 0; i < kMaxChunks; i++) {
+				if (!chunkLive[i])
+					continue;
+				const uint64_t other = chunkOff[i];
+				overlaps |= off < other + chunkBytes && other < off + chunkBytes;
+			}
+		}
+		if ((off & (chunkBytes - 1)) || off > ~0ull - chunkBytes || overlaps) {
 			b.freeChunk(b.context, off);
 			return false;
 		}
