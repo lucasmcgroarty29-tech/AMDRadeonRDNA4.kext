@@ -2649,6 +2649,10 @@ IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &
 	if (c) {
 		b.va = vaTake(*c, bytes);
 		if (!b.va || !vmMap(*c, b.va, b.mc, bytes, true)) {   /* IBs live in user buffers: R|W|X like Mesa (ac_linux_drm.c:235) */
+			if (c->mapQuarantined) {
+				RLOG("vmid %u: allocation retained after unsafe map rollback", c->vmid);
+				return kIOReturnNotResponding;
+			}
 			if (b.va)
 				vaGive(*c, b.va, bytes);
 			h.free(b.offset); b.owner = nullptr;
@@ -2805,6 +2809,11 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
                 (flags & RDNA4_HOST_EXECUTABLE) != 0, (flags & RDNA4_HOST_READ_ONLY) != 0)) {
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: host buffer retained after unsafe page-table rollback", c->vmid);
+			leakHost(b);
+			return kIOReturnNotResponding;
+		}
 		if (b.va) {
 			const bool unmapped = vmUnmap(*c, b.va, rounded);
 			const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed host-map cleanup");
@@ -2881,6 +2890,10 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 	b.host = true;   // unmapped like a host buffer; it has no memory of its own to release
 	b.mapped = true;
 	if (!b.va || b.va + bytes < b.va || b.va + bytes > GpuVm::kVaEnd || !vmMapHost(*c, b.va, pageBuses, bytes, false)) {
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: mapped-page buffer retained after unsafe page-table rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		if (b.va) {
 			const bool unmapped = vmUnmap(*c, b.va, bytes);
 			const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed page-map cleanup");
@@ -3060,6 +3073,10 @@ IOReturn RDNA4Compute::mapMcLocked(const void *owner, uint64_t mc, uint64_t byte
 	b.gen = generation;
 	b.foreign = true;
 	if (!b.va || !vmMap(*c, b.va, b.mc, b.bytes, false)) {
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: foreign mapping retained after unsafe rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		if (b.va)
 			vaGive(*c, b.va, b.bytes);
 		b.owner = nullptr;
@@ -3157,6 +3174,10 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 		p.va = vaTake(*c, p.vaBytes);
 
 		if (!p.va || !vmMap(*c, p.va, poolMc(off), p.vaBytes, true)) {
+			if (c->mapQuarantined) {
+				RLOG("vmid %u: program allocation retained after unsafe map rollback", c->vmid);
+				return kIOReturnNotResponding;
+			}
 			if (p.va)
 				vaGive(*c, p.va, p.vaBytes);
 
@@ -4202,6 +4223,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	rdna4Step("rtRelease: rtLock taken");
 	checkPresentationTimeoutLocked();
 	RtClient *early = clientFor(owner);
+	if (early && early->mapQuarantined && !powerSleeping) {
+		RLOG("vmid %u: client close deferred; unsafe page-table rollback retains its address space and allocations until GPU reset",
+		     early->vmid);
+		return;
+	}
 	if (powerSleeping || (early && early->aborted)) {
 		// Hardware is off or has already been rebuilt. The resume cleanup owns
 		// the old allocations (and dropped the pending presents); never touch
