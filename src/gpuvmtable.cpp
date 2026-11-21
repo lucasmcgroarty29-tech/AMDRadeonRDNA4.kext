@@ -64,6 +64,20 @@ bool mapVram(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 	    end - va - GpuVm::kPageBytes > GpuVm::kPhysicalMask - physical)
 		return false;
 
+	/* Resolve every table entry and directory-page address before the first
+	 * write. The dense accessors are stable while the runtime lock is held;
+	 * this prevents a late accessor failure from leaving a mapped prefix. */
+	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes) {
+		const uint64_t ptOff = densePt(at);
+		uint64_t ptPhysical = 0;
+		if (ptOff > tableBytes || tableBytes - ptOff < GpuVm::kPageBytes ||
+		    !a.entry(a.context, densePde(at)) ||
+		    !a.entry(a.context, densePte(at)) ||
+		    !a.phys(a.context, ptOff, ptPhysical) ||
+		    (ptPhysical & (GpuVm::kPageBytes - 1)) || ptPhysical > GpuVm::kPhysicalMask)
+			return false;
+	}
+
 	for (uint64_t at = va, phys = physical; at < end;
 	     at += GpuVm::kPageBytes, phys += GpuVm::kPageBytes) {
 		if (at < GpuVm::kVaStart || at >= GpuVm::kVaStart + denseVa(tableBytes))
@@ -103,6 +117,19 @@ bool mapHost(const Access &a, const Policy &pol, uint64_t tableBytes, uint64_t v
 		if ((pageBuses[page] & (GpuVm::kPageBytes - 1)) ||
 		    pageBuses[page] > GpuVm::kPhysicalMask)
 			return false;
+
+	/* As with mapVram, resolve the entire dense mapping before writing a PDE
+	 * or PTE. A late missing table page must not leave a mapped prefix. */
+	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes) {
+		const uint64_t ptOff = densePt(at);
+		uint64_t ptPhysical = 0;
+		if (ptOff > tableBytes || tableBytes - ptOff < GpuVm::kPageBytes ||
+		    !a.entry(a.context, densePde(at)) ||
+		    !a.entry(a.context, densePte(at)) ||
+		    !a.phys(a.context, ptOff, ptPhysical) ||
+		    (ptPhysical & (GpuVm::kPageBytes - 1)) || ptPhysical > GpuVm::kPhysicalMask)
+			return false;
+	}
 
 	uint64_t page = 0;
 	for (uint64_t at = va; at < end; at += GpuVm::kPageBytes, page++) {
