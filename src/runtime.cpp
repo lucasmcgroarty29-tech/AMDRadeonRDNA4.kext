@@ -4178,36 +4178,33 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	}
 
 	uint32_t nb = 0, np = 0;
-	bool hostUnmapped = false;
+	bool unmapsSynced = true;
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner) {
-			if (c)
-				vmUnmap(*c, b.va, b.bytes);
-			if (b.host) {
-				hostUnmapped = true;
-			} else {
-				(b.device ? devHeap : heap).free(b.offset);
-				b.owner = nullptr;
-			}
+			if (c && b.va)
+				unmapsSynced = vmUnmap(*c, b.va, b.bytes) && unmapsSynced;
 			nb++;
 		}
 	}
 	for (RtProgram &p : programs) {
 		if (p.owner == owner) {
-			if (c)
-				vmUnmap(*c, p.va, heap.lengthOf(p.offset));
-			heap.free(p.offset);
-			p.owner = nullptr;
+			if (c && p.va)
+				unmapsSynced = vmUnmap(*c, p.va, heap.lengthOf(p.offset)) && unmapsSynced;
 			np++;
 		}
 	}
-	const bool hostForgotten = !c || !hostUnmapped || vmInvalidateOwned(*c, "host unmap");
-
-	if (!hostForgotten)
-		RLOG("vmid %u: host buffer cleanup invalidation timed out: their pages are kept, not reused", c->vmid);
+	/* Do not return ANY of this client's allocations until every changed page-table
+	 * range was synced and every VMID that could cache it was invalidated. This
+	 * includes device buffers and code, not just imported host pages. */
+	const bool mappingsForgotten = !c || !vmEnabled || !(nb || np) ||
+	                               (unmapsSynced && vmInvalidateOwned(*c, "client close unmap"));
+	if (!mappingsForgotten)
+		RLOG("vmid %u: client close unmap sync/invalidation failed; all mapped allocations are retained", c ? c->vmid : 0);
 
 	for (RtBuffer &b : buffers) {
-		if (b.owner == owner && b.host) {
+		if (b.owner != owner)
+			continue;
+		if (b.host) {
 			const uint64_t rounded = b.mapped || b.hostImported ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
 			                                                          ~(GpuVm::kPageBytes - 1);
 			if (c && c->hostBytes >= rounded)
@@ -4215,15 +4212,25 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			if (hostBytesTotal >= rounded)
 				hostBytesTotal -= rounded;
 			RLOG("vmid %u: host buffer unmapped during client close", c ? c->vmid : 0);
-			if (hostForgotten)
+			if (mappingsForgotten)
 				releaseHost(b);
 			else
 				leakHost(b);
-			b.owner = nullptr;
+		} else if (!b.foreign && mappingsForgotten) {
+			(b.device ? devHeap : heap).free(b.offset);
 		}
+		b.owner = nullptr;
+	}
+	for (RtProgram &p : programs) {
+		if (p.owner != owner)
+			continue;
+		if (mappingsForgotten)
+			heap.free(p.offset);
+		p.owner = nullptr;
 	}
 	if (nb || np)
-		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
+		RLOG("client closed: %s %u buffer(s), %u program(s)",
+		     mappingsForgotten ? "released" : "retained", nb, np);
 	if (c && vmEnabled) {
 		if (c->shared) {
 			/* No HQD to dequeue. Jobs still in flight on the shared queue must finish before the tables go: wait (bounded) for
