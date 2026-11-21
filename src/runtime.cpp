@@ -4717,6 +4717,10 @@ void RDNA4Compute::resetRuntimeForResume() {
 // ---------------------------------------------------------------------------
 
 // One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
+// Serialization contract: after publication, callers hold rtLock (the
+// runtime entry points and their helpers do); during bring-up, only the
+// exclusive bring-up thread submits work, before rtReady is published.
+// stageSdma has its own direct ring test under that same bring-up exclusion.
 bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
 	// Once any engine or runtime path is quarantined, do not submit more work
 	// to the ring. A later successful fence cannot retroactively prove that
@@ -4736,8 +4740,9 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	uint32_t fence[Sdma::kFenceDwords];
 	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
-	Sdma::fence(fence, poolMc(kSdmaFenceOffset), value);
-	Sdma::trap(trap);
+	if (Sdma::fence(fence, poolMc(kSdmaFenceOffset), value) != Sdma::kFenceDwords ||
+	    Sdma::trap(trap) != Sdma::kTrapDwords)
+		return false;
 	if (!sdmaRing.emit(pkt, dwords) || !sdmaRing.emit(fence, Sdma::kFenceDwords) ||
 	    !sdmaRing.emit(trap, Sdma::kTrapDwords))
 		return false;
@@ -4827,8 +4832,7 @@ bool RDNA4Compute::agpReach(uint64_t busEnd) {
 	return true;
 }
 
-// A buffer's VRAM before it goes to its owner: the last one's data must not reach the next. CONST_FILL in pieces of 64 MiB, well
-// within the packet's byte count.
+// A buffer's VRAM before it goes to its owner: the last one's data must not reach the next. Split into SDMA 7's 4 MiB packet limit.
 bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
 	// SDMA 7's documented buffer-function limit is 4 MiB per packet.
 	constexpr uint64_t kPiece = 4ull << 20;
