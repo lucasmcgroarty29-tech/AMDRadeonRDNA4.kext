@@ -270,21 +270,37 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 		}
 		c.vmid = g.vmid;
 		if (!vmContextInit(c)) {
-			SLOG("VMID %u: context programming for client slot %d failed", g.vmid, static_cast<int>(&c - clients));
-			uint32_t dropped = 0;
-			vmPool.forget(reinterpret_cast<uintptr_t>(&c), true, dropped);
+			SLOG("VMID %u: context programming for client slot %d failed; quarantining it", g.vmid, static_cast<int>(&c - clients));
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			(void)vmInvalidate(g.vmid, "vmpool context-init failure");
+			vmPool.quarantine(g.vmid);
+			c.vmid = 0;
 			return 0;
 		}
 		wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, c.pasid);      // IH_VMID_n_LUT = PASID: a fault vector from this VMID names the client
-		(void)vmInvalidate(g.vmid, "vmpool rebind");
+		if (!vmInvalidate(g.vmid, "vmpool rebind")) {
+			SLOG("VMID %u: rebind invalidate timed out; context disabled and VMID quarantined", g.vmid);
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			vmPool.quarantine(g.vmid);
+			c.vmid = 0;
+			return 0;
+		}
 		if (g.stolen)
 			SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
 			     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
 			     static_cast<int>(&c - clients), c.pasid);
 	} else {
 		c.vmid = g.vmid;
-		if (g.flush)
-			(void)vmInvalidate(g.vmid, "vmpool flush");
+		if (g.flush && !vmInvalidate(g.vmid, "vmpool flush")) {
+			SLOG("VMID %u: reuse invalidate timed out; context disabled and VMID quarantined", g.vmid);
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			vmPool.quarantine(g.vmid);
+			c.vmid = 0;
+			return 0;
+		}
 	}
 	return g.vmid;
 }
@@ -297,7 +313,10 @@ void RDNA4Compute::vmReleaseVmids(RtClient &c) {
 			continue;
 		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
 		wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
-		(void)vmInvalidate(v, "vmpool release");
+		if (!vmInvalidate(v, "vmpool release")) {
+			SLOG("VMID %u: release invalidate timed out; quarantined until GPU reset", v);
+			vmPool.quarantine(v);
+		}
 	}
 	uint32_t first = 0;
 	vmPool.forget(owner, true, first);
