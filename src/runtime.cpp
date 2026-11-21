@@ -4353,6 +4353,10 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	 * includes device buffers and code, not just imported host pages. */
 	const bool mappingsForgotten = !c || !vmEnabled || !(nb || np) ||
 	                               (unmapsSynced && vmInvalidateOwned(*c, "client close unmap"));
+	if (c && c->mapQuarantined) {
+		RLOG("vmid %u: client close deferred after TLB invalidation failure; address space and allocations retained", c->vmid);
+		return;
+	}
 	if (!mappingsForgotten)
 		RLOG("vmid %u: client close unmap sync/invalidation failed; all mapped allocations are retained", c ? c->vmid : 0);
 
