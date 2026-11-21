@@ -4718,6 +4718,11 @@ void RDNA4Compute::resetRuntimeForResume() {
 
 // One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
 bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
+	// Once any engine or runtime path is quarantined, do not submit more work
+	// to the ring. A later successful fence cannot retroactively prove that
+	// earlier timed-out work stopped touching its backing memory.
+	if (sdmaQuarantined || resumeQuarantined)
+		return false;
 	uint32_t fence[Sdma::kFenceDwords];
 	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
@@ -4947,6 +4952,10 @@ bool RDNA4Compute::dmaInit() {
 	uint32_t move[Sdma::kCopyDwords];
 	Sdma::copyLinear(move, poolMc(kDmaTestOffset + n), poolMc(kDmaTestOffset), n);
 	const bool moved = sdmaRun(move, Sdma::kCopyDwords, 2000);
+	if (!moved) {
+		dmaTeardown("the VRAM-to-VRAM self-test copy did not complete");
+		return false;
+	}
 	uint32_t wrongMoved = 0, firstMoved = 0;
 	for (uint32_t i = 0; i < n / 4; i++) {
 		const uint32_t m = *poolDw(kDmaTestOffset + 4 * i);
