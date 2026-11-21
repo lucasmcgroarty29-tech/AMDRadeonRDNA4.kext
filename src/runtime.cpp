@@ -831,8 +831,13 @@ bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
 	if (span.firstPt == ~0ull)
 		return true;
-	if (c.tableCpu)
-		return vmSyncCpu(c, va, end);
+	if (c.tableCpu) {
+		if (vmSyncCpu(c, va, end))
+			return true;
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: CPU-table unmap sync failed; client quarantined", c.vmid);
+		return false;
+	}
 	if (!vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000))) {
 		c.mapQuarantined = c.aborted = true;
 		RLOG("vmid %u: dense page-table unmap sync failed; client quarantined", c.vmid);
