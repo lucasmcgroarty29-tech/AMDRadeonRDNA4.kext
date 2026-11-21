@@ -2624,6 +2624,10 @@ bool RDNA4Compute::sdmaQueueInit() {
 	const uint64_t ring = poolMc(kSdmaRingOffset);
 	const uint32_t sizeLog2 = 10;   // 4 KiB = 1024 dwords
 	uint32_t rb = rdGc(sdma(0, SdmaQ0RbCntl));
+	if (rb == kBad) {
+		CLOG("sdma: SDMA0 RB control is inaccessible; refusing queue programming");
+		return false;
+	}
 	rb = (rb & ~(kSdmaRbSizeMask | kSdmaRbEnable)) | (sizeLog2 << kSdmaRbSizeShift) | kSdmaRbPriv;
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb);
 	// Fresh engine: 0 (sdma_v7_0_gfx_resume_instance). After a wake WITHOUT power loss: the engine's own 64-bit pointers (sdmaStartPtr, P7).
