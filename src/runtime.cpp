@@ -2830,6 +2830,7 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
 		if (c->mapQuarantined) {
 			RLOG("vmid %u: host buffer retained after unsafe page-table rollback", c->vmid);
 			leakHost(b);
+			b.host = true;   // retain its slot as host-backed so reset never frees heap offset zero
 			return kIOReturnNotResponding;
 		}
 		if (b.va) {
@@ -4526,7 +4527,9 @@ void RDNA4Compute::resetRuntimeForResume() {
 			continue;
 		if (b.host)
 			releaseHost(b);
-		else if (b.device)
+		else if (b.foreign) {
+			/* rtMapVram does not own the physical allocation, even on reset. */
+		} else if (b.device)
 			devHeap.free(b.offset);
 		else
 			heap.free(b.offset);
