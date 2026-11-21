@@ -581,8 +581,21 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		return;
 	}
 	const bool stopped = !self->bringupStepAllowed("resume reset");
-	if (!stopped)
-	self->resetRuntimeForResume();
+	bool retainOldRuntime = false;
+	if (!stopped && self->rtLock) {
+		IOLockLock(self->rtLock);
+		retainOldRuntime = self->resumeQuarantined;
+		if (retainOldRuntime) {
+			for (RtClient &client : self->clients)
+				if (client.active)
+					client.mapQuarantined = client.aborted = true;
+		}
+		IOLockUnlock(self->rtLock);
+	}
+	if (!stopped && !retainOldRuntime)
+		self->resetRuntimeForResume();
+	else if (retainOldRuntime)
+		CLOG("power: wake did not prove every GPU queue stopped; preserving old heaps, buffers, programs and page tables; compute runtime remains offline");
 	if (!stopped)
 		self->runStages();
 	self->endBringup();
