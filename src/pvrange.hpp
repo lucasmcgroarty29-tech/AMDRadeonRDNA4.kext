@@ -36,10 +36,17 @@ static inline bool pageCount(uint64_t offset, uint64_t bytes, uint64_t pageSize,
 	const uint64_t whole = bytes / pageSize;
 	const uint64_t tail = bytes % pageSize;
 	const uint64_t span = offset % pageSize;
-	if (tail > UINT64_MAX - span)
-		return false;
-	const uint64_t partial = tail + span;
-	const uint64_t extra = partial / pageSize + (partial % pageSize != 0);
+
+	// Compute ceil((span + tail) / pageSize) without forming span + tail:
+	// both operands can be close to UINT64_MAX for a very large page size.
+	uint64_t extra = 0;
+	if (tail) {
+		extra = 1;
+		if (span > pageSize - tail)
+			++extra;
+	} else if (span) {
+		extra = 1;
+	}
 	if (whole > UINT64_MAX - extra)
 		return false;
 
