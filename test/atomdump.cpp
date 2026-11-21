@@ -3382,8 +3382,12 @@ static int testSdmaPackets() {
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
 	                  "sdma: TRAP %08x %08x", p[0], p[1]);
+	failures += check(Sdma::constFill(p, b, 0, 0x400000) == Sdma::kFillDwords &&
+	                  p[4] == 0x003fffff, "sdma: maximum 4 MiB CONST_FILL accepted");
 	failures += check(!Sdma::constFill(p, b, 0, 0) && !Sdma::constFill(p, b, 0, 0x400004) &&
 	                  !Sdma::constFill(p, b + 1, 0, 4), "sdma: invalid CONST_FILL accepted");
+	failures += check(Sdma::copyLinear(p, a, b, 0x400000) == Sdma::kCopyDwords &&
+	                  p[1] == 0x003fffff, "sdma: maximum 4 MiB COPY_LINEAR accepted");
 	failures += check(!Sdma::copyLinear(p, a, b, 0) && !Sdma::copyLinear(p, a, b, 0x400001) &&
 	                  !Sdma::copyLinear(p, UINT64_MAX - 1, b, 4), "sdma: invalid COPY_LINEAR accepted");
 	failures += check(!Sdma::writeDword(p, a + 1, 1) && !Sdma::fence(p, UINT64_MAX - 1, 1),
