@@ -2505,20 +2505,34 @@ void RDNA4Compute::logGcFault(const char *tag) {
 // register is written; the RS64 firmware's init (UCODE_INIT_DONE) may reset
 // the queue context, so the queue is programmed after it.
 bool RDNA4Compute::sdmaStartMcus() {
-	for (uint32_t i = 0; i < kSdmaInstances; i++)
+	// Both instances must finish firmware initialisation before queue 0 is
+	// programmed. A successful SDMA0 status says nothing about SDMA1.
+	for (uint32_t i = 0; i < kSdmaInstances; i++) {
+		const uint32_t control = rdGc(sdma(i, SdmaMcuCntl));
+		if (control == kBad) {
+			CLOG("sdma: SDMA%u MCU control is inaccessible; refusing queue bring-up", i);
+			return false;
+		}
 		wr(IpDiscovery::HwGc, sdma(i, SdmaMcuCntl),
-		   rdGc(sdma(i, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
-	uint32_t s0 = 0;
-	for (uint32_t ms = 0; ms < 100; ms++) {
-		s0 = rdGc(sdma(0, SdmaStatusReg));
-		if (s0 != kBad && (s0 & kSdmaUcodeInitDone))
-			break;
-		IOSleep(1);
+		   control & ~(kSdmaMcuHalt | kSdmaMcuReset));
 	}
-	const uint32_t s1 = rdGc(sdma(1, SdmaStatusReg));
-	CLOG("sdma: MCUs unhalted: SDMA0 status 0x%08x (ucode init %s), SDMA1 status 0x%08x", s0,
-	     (s0 & kSdmaUcodeInitDone) ? "done" : "NOT done", s1);
-	return s0 != kBad && (s0 & kSdmaUcodeInitDone);
+	bool ready = true;
+	for (uint32_t i = 0; i < kSdmaInstances; i++) {
+		uint32_t status = kBad;
+		for (uint32_t ms = 0; ms < 100; ms++) {
+			status = rdGc(sdma(i, SdmaStatusReg));
+			if (status != kBad && (status & kSdmaUcodeInitDone))
+				break;
+			IOSleep(1);
+		}
+		if (status == kBad || !(status & kSdmaUcodeInitDone)) {
+			ready = false;
+			CLOG("sdma: SDMA%u firmware did not become ready (status 0x%08x)", i, status);
+		} else {
+			CLOG("sdma: SDMA%u firmware ready (status 0x%08x)", i, status);
+		}
+	}
+	return ready;
 }
 
 // gmc_v12_0_flush_vm_hub for VMID0 on the GC hub (engine 17, no semaphore).
@@ -2655,7 +2669,25 @@ bool RDNA4Compute::sdmaQueueInit() {
 	   rdGc(sdma(0, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb | kSdmaRbEnable);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0IbCntl), rdGc(sdma(0, SdmaQ0IbCntl)) | kSdmaIbEnable);
+	const uint32_t ib = rdGc(sdma(0, SdmaQ0IbCntl));
+	if (ib == kBad) {
+		CLOG("sdma: SDMA0 IB control is inaccessible during queue enable");
+		return false;
+	}
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0IbCntl), ib | kSdmaIbEnable);
+
+	// Read back the state that makes the queue capable of accepting work.
+	// A posted write or inaccessible register is not a successful init.
+	const uint32_t status = rdGc(sdma(0, SdmaStatusReg));
+	const uint32_t rbCheck = rdGc(sdma(0, SdmaQ0RbCntl));
+	const uint32_t ibCheck = rdGc(sdma(0, SdmaQ0IbCntl));
+	if (status == kBad || !(status & kSdmaUcodeInitDone) ||
+	    rbCheck == kBad || !(rbCheck & kSdmaRbEnable) ||
+	    ibCheck == kBad || !(ibCheck & kSdmaIbEnable)) {
+		CLOG("sdma: queue enable readback failed: status 0x%08x RB_CNTL 0x%08x IB_CNTL 0x%08x",
+		     status, rbCheck, ibCheck);
+		return false;
+	}
 	return true;
 }
 
@@ -2746,9 +2778,18 @@ bool RDNA4Compute::stageSdma() {
 	*poolDw(kSdmaWptrOffset + 4) = static_cast<uint32_t>(startPtr >> 32);
 	flushHdp();
 	trail("s4: SDMA MCU unhalt");
-	sdmaStartMcus();
+	if (!sdmaStartMcus()) {
+		publish();
+		return false;
+	}
 	sdmaDoorbell = doorbellMapBar();
-	sdmaQueueInit();
+	if (!sdmaQueueInit()) {
+		// Queue programming has begun and the engine may have observed some
+		// of it. Keep the ring backing until a later proven reset.
+		quarantine("SDMA queue initialisation/readback failure");
+		publish();
+		return false;
+	}
 	status();
 
 	// 3. First packet: one dword written by the engine (amdgpu's ring test),
