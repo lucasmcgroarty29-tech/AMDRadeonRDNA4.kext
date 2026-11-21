@@ -2755,8 +2755,13 @@ bool RDNA4Compute::stageSdma() {
 	//    kicked through the doorbell as amdgpu does; if it does not land,
 	//    the doorbell goes off and the RB_WPTR registers are tried.
 	trail("s4: SDMA WRITE_LINEAR test");
-	uint32_t pkt[8];
-	ring.emit(pkt, Sdma::writeDword(pkt, poolMc(kSdmaTestOffset), 0xDEADBEEF));
+	uint32_t pkt[Sdma::kWriteDwords];
+	if (Sdma::writeDword(pkt, poolMc(kSdmaTestOffset), 0xDEADBEEF) != Sdma::kWriteDwords ||
+	    !ring.emit(pkt, Sdma::kWriteDwords)) {
+		CLOG("sdma: could not encode or enqueue the initial WRITE_LINEAR probe");
+		publish();
+		return false;
+	}
 	auto landed = [this]() {
 		for (uint32_t ms = 0; ms < 200; ms++) {
 			if (*poolDw(kSdmaTestOffset) == 0xDEADBEEF)
@@ -2798,8 +2803,18 @@ bool RDNA4Compute::stageSdma() {
 	*poolDw(kFillOffset + kFillBytes - 4) = 0;
 	flushHdp();
 	uint64_t t0 = mach_absolute_time();
-	ring.emit(pkt, Sdma::constFill(pkt, poolMc(kFillOffset), pattern, kFillBytes));
-	ring.emit(pkt, Sdma::fence(pkt, poolMc(kSdmaFenceOffset), sdmaFence = 1));
+	uint32_t fill[Sdma::kFillDwords], fence[Sdma::kFenceDwords];
+	const uint32_t fillDwords = Sdma::constFill(fill, poolMc(kFillOffset), pattern, kFillBytes);
+	const uint32_t fenceDwords = Sdma::fence(fence, poolMc(kSdmaFenceOffset), sdmaFence = 1);
+	const uint64_t sequenceDwords = static_cast<uint64_t>(fillDwords) + fenceDwords;
+	if (fillDwords != Sdma::kFillDwords || fenceDwords != Sdma::kFenceDwords ||
+	    sequenceDwords >= ring.sizeBytes() / 4 ||
+	    ring.wptr() > UINT64_MAX - sequenceDwords * 4 ||
+	    !ring.emit(fill, fillDwords) || !ring.emit(fence, fenceDwords)) {
+		CLOG("sdma: could not encode or enqueue the CONST_FILL/FENCE probe; ring was not kicked");
+		publish();
+		return false;
+	}
 	sdmaKick(ring.wptr());
 	bool fenced = false;
 	for (uint32_t us = 0; us < 500000 && !fenced; us += 10) {
