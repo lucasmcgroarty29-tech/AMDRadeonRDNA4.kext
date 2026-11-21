@@ -697,7 +697,7 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 		}
 		if (sparseSync(c))
 			return true;
-		treeUnmap(tree, va, end);
+		GpuVmTable::treeUnmap(tree, va, end);
 		if (!sparseSync(c)) {
 			c.mapQuarantined = c.aborted = true;
 			RLOG("vmid %u: sparse VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
@@ -754,7 +754,7 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 		}
 		if (sparseSync(c))
 			return true;
-		treeUnmap(tree, va, end);
+		GpuVmTable::treeUnmap(tree, va, end);
 		if (!sparseSync(c)) {
 			c.mapQuarantined = c.aborted = true;
 			RLOG("vmid %u: sparse host-map rollback sync failed; client allocations quarantined", c.vmid);
