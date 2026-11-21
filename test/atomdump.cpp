@@ -3370,9 +3370,10 @@ static int testSdmaPackets() {
 	failures += check(Sdma::writeDword(p, a, 0xDEADBEEF) == 5 && p[0] == 0x00000002 &&
 	                  p[1] == 0x09002000 && p[2] == 0x80 && p[3] == 0 && p[4] == 0xDEADBEEF,
 	                  "sdma: WRITE_LINEAR %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3], p[4]);
-	failures += check(Sdma::fence(p, a + 0x41, 7) == 4 && p[0] == 0x00030005 &&
+	failures += check(Sdma::fence(p, a + 0x40, 7) == 4 && p[0] == 0x00030005 &&
 	                  p[1] == 0x09002040 && p[2] == 0x80 && p[3] == 7,
 	                  "sdma: FENCE %08x %08x %08x %08x", p[0], p[1], p[2], p[3]);
+	failures += check(!Sdma::fence(p, a + 0x41, 7), "sdma: unaligned FENCE address silently rounded down");
 	failures += check(Sdma::constFill(p, b, 0x5A5AC0DE, 1u << 20) == 5 && p[0] == 0x8000000b &&
 	                  p[1] == 0x10000000 && p[2] == 0x80 && p[3] == 0x5A5AC0DE && p[4] == 0xfffff,
 	                  "sdma: CONST_FILL %08x .. %08x", p[0], p[4]);
@@ -3381,12 +3382,20 @@ static int testSdmaPackets() {
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
 	                  "sdma: TRAP %08x %08x", p[0], p[1]);
+	failures += check(!Sdma::constFill(p, b, 0, 0) && !Sdma::constFill(p, b, 0, 0x400004) &&
+	                  !Sdma::constFill(p, b + 1, 0, 4), "sdma: invalid CONST_FILL accepted");
+	failures += check(!Sdma::copyLinear(p, a, b, 0) && !Sdma::copyLinear(p, a, b, 0x400001) &&
+	                  !Sdma::copyLinear(p, UINT64_MAX - 1, b, 4), "sdma: invalid COPY_LINEAR accepted");
+	failures += check(!Sdma::writeDword(p, a + 1, 1) && !Sdma::fence(p, UINT64_MAX - 1, 1),
+	                  "sdma: invalid WRITE/FENCE address accepted");
+	failures += check(!Sdma::indirect(p, a + 1, 8, 1) && !Sdma::indirect(p, a, 7, 1) &&
+	                  !Sdma::indirect(p, a, 8, 16), "sdma: invalid INDIRECT parameters accepted");
 	// A command buffer run in another address space (SDMA_OP_INDIRECT 4, the VMID at bit 16, the buffer 32-byte
 	// aligned), and the padding that makes the packet end on an 8-dword boundary of the ring.
 	bool padded = true;
 	for (uint32_t dw = 0; dw < 64; dw++)
 		padded &= Sdma::indirectPad(dw * 4) < 8 && (dw + Sdma::indirectPad(dw * 4) + Sdma::kIndirectDwords) % 8 == 0;
-	failures += check(Sdma::indirect(p, 0xffff80000000101full, 8, 8) == 6 && p[0] == 0x00080004 && p[1] == 0x00001000 &&
+	failures += check(Sdma::indirect(p, 0xffff800000001020ull, 8, 8) == 6 && p[0] == 0x00080004 && p[1] == 0x00001020 &&
 	                  p[2] == 0xffff8000 && p[3] == 8 && p[4] == 0 && p[5] == 0 && padded,
 	                  "sdma: INDIRECT %08x %08x %08x %08x, ends on an 8-dword boundary from any write pointer", p[0], p[1],
 	                  p[2], p[3]);
