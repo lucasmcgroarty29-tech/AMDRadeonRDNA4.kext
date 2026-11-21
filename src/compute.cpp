@@ -2701,7 +2701,7 @@ bool RDNA4Compute::stageSdma() {
 	auto quarantine = [this](const char *why) {
 		sdmaQuarantined = true;
 		resumeQuarantined = true;
-		RLOG("sdma: stage test could not prove queue quiescence (%s); retaining runtime backing", why);
+		CLOG("sdma: stage test could not prove queue quiescence (%s); retaining runtime backing", why);
 	};
 
 	// 1. GC hub, after the microengines' start addresses (amdgpu's order).
