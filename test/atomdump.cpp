@@ -4763,6 +4763,50 @@ static int testDense4GiB() {
 	f += check(resolves(V + 0x1000, MC, 0x3000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000), "dense: the earlier maps are undisturbed");
 	f += check(!map(V + 4 * G - 0x1000, MC, 0x2000), "dense: a map past 4 GiB is refused");
 	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
+
+	/* A late accessor failure must be discovered before either dense mapper
+	 * writes the valid prefix. */
+	{
+		struct FaultAccess { uint64_t *words; uint64_t failOffset; };
+		static std::vector<uint64_t> faultWords;
+		faultWords.assign(GpuVmTable::kDenseTableBytes / 8, 0);
+		auto faultEntry = [](void *ctx, uint64_t off) -> uint64_t * {
+			auto *f = static_cast<FaultAccess *>(ctx);
+			return off == f->failOffset || off >= GpuVmTable::kDenseTableBytes
+			           ? nullptr : f->words + off / 8;
+		};
+		auto faultPhys = [](void *ctx, uint64_t off, uint64_t &out) {
+			auto *f = static_cast<FaultAccess *>(ctx);
+			if (off == f->failOffset || off >= GpuVmTable::kDenseTableBytes)
+				return false;
+			out = kRootPhys + off;
+			return true;
+		};
+		const uint64_t start = V + 0x800000;
+		const uint64_t end = start + 0x2000;
+		FaultAccess fault { faultWords.data(), GpuVmTable::densePte(start + 0x1000) };
+		const GpuVmTable::Access faultTable { faultEntry, faultPhys, &fault };
+		GpuVmTable::Span span;
+		const bool vramMapped = GpuVmTable::mapVram(faultTable, GpuVmTable::Policy {},
+		                                             GpuVmTable::kDenseTableBytes, start, end,
+		                                             0x200000, false, span);
+		bool vramUntouched = true;
+		for (uint64_t word : faultWords)
+			vramUntouched &= word == 0;
+		f += check(!vramMapped && vramUntouched,
+		           "dense: a late missing PTE accessor leaves the complete VRAM mapping untouched");
+
+		fault.failOffset = GpuVmTable::densePte(start + 0x1000);
+		const uint64_t buses[2] = { 0x104000000ull, 0x104001000ull };
+		const bool hostMapped = GpuVmTable::mapHost(faultTable, GpuVmTable::Policy {},
+		                                             GpuVmTable::kDenseTableBytes, start, end,
+		                                             buses, false, span);
+		bool hostUntouched = true;
+		for (uint64_t word : faultWords)
+			hostUntouched &= word == 0;
+		f += check(!hostMapped && hostUntouched,
+		           "dense: a late missing host PTE accessor leaves the complete host mapping untouched");
+	}
 	return f;
 }
 
