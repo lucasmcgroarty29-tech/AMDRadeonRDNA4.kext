@@ -899,6 +899,7 @@ private:
 		uint32_t gfxFences[kMaxGfxIbOutstanding] {};
 		uint32_t gfxOutstanding { 0 };
 		bool gfxQuarantined { false };   // gfx ring wedged while this client's IBs may still be in flight
+		bool mapQuarantined { false };  // page-table rollback could not be synced; retain this client's allocations until reset
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
