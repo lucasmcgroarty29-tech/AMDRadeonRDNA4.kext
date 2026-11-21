@@ -2881,6 +2881,10 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	RtClient *c = vmClientFor(owner);
 	if (c && c->gfxOutstanding && owner != idleFreeOwner)
 		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
+	if (c && c->gfxQuarantined) {
+		RLOG("vmid %u: buffer free refused; a graphics IB may still be using this client's memory", c->vmid);
+		return kIOReturnNotResponding;
+	}
 	const bool host = b->host;
 	const bool unmapped = !b->va || (c && vmUnmap(*c, b->va, b->bytes));
 	/* Every unmap is followed by an invalidation before the memory goes back to its heap
@@ -3152,6 +3156,10 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 		return kIOReturnBadArgument;
 	bool forgotten = !vmClientFor(owner);
 	if (RtClient *c = vmClientFor(owner)) {
+		if (c->gfxQuarantined) {
+			RLOG("vmid %u: program unload refused; a graphics IB may still be using this client's code", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		const bool unmapped = vmUnmap(*c, p->va, heap.lengthOf(p->offset));
 		/* As rtFree: both the page-table write and TLB invalidate must complete
 		 * before the VA or code allocation can be handed to another client. */
@@ -3699,8 +3707,11 @@ void RDNA4Compute::gfxClientWedge(const char *why) {
 	     "the CP fetches nothing more, and gfx submissions are refused until the next bring-up; compute queues and the display are not affected "
 	     "(a wave that is stuck in a shader may keep the GC busy: power-cycle if it does)", why);
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
-	for (RtClient &c : clients)
+	for (RtClient &c : clients) {
+		if (c.gfxOutstanding)
+			c.gfxQuarantined = true;   // the ring's lost fences no longer prove these clients' work has ended
 		c.gfxOutstanding = 0;
+	}
 	gfxClientPending = 0;
 }
 
@@ -4213,7 +4224,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 
 	// Work that could not be ended may still read and write the client's memory: it is left allocated (and its VMID taken) rather than
 	// handed to someone else. A wedged gfx ring halted the CP, but a wave stuck in a shader still runs.
-	if (c && ((gfxBusy && gfxWedged) || !computeDone)) {
+	if (c && (c->gfxQuarantined || (gfxBusy && gfxWedged) || !computeDone)) {
 		quarantineLocked(owner, *c);
 		return;
 	}
