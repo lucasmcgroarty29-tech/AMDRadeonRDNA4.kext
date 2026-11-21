@@ -4855,8 +4855,17 @@ static int testSparseTree() {
 		e.sync();
 		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
 		           "tree: a later host mapping into an existing PT page reaches VRAM");
-		buses[3] |= 0x40;
-		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+		const uint64_t badVa = hv + 0x20000;
+		const uint32_t pagesBeforeBadMap = e.sp.pages();
+		buses[7] = GpuVm::kPhysicalMask + GpuVm::kPageBytes;  // aligned, but outside gfx12's physical-address field
+		const bool badRange = GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false);
+		e.sync();
+		f += check(!badRange && e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys) &&
+		           !e.translate(badVa + 0x6000, phys),
+		           "tree: a bad final bus address rejects the whole range before mapping its valid prefix");
+		buses[3] = 0x104048000ull + 0x3000ull * 3 | 0x40;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false),
+		           "tree: a misaligned bus address is refused");
 	}
 
 	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.
