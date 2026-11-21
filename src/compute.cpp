@@ -2623,9 +2623,23 @@ void RDNA4Compute::cpConfigRs64() {
 bool RDNA4Compute::sdmaQueueInit() {
 	const uint64_t ring = poolMc(kSdmaRingOffset);
 	const uint32_t sizeLog2 = 10;   // 4 KiB = 1024 dwords
+	// Read every register whose existing bits must be preserved before the
+	// first queue write. An all-ones MMIO failure sentinel must never become
+	// the input to a read/modify/write operation.
 	uint32_t rb = rdGc(sdma(0, SdmaQ0RbCntl));
-	if (rb == kBad) {
-		CLOG("sdma: SDMA0 RB control is inaccessible; refusing queue programming");
+	const uint32_t ib = rdGc(sdma(0, SdmaQ0IbCntl));
+	const uint32_t db = rdGc(sdma(0, SdmaQ0Doorbell));
+	const uint32_t watchdog = rdGc(sdma(0, SdmaWatchdogCntl));
+	const uint32_t utcl1Cntl = rdGc(sdma(0, SdmaUtcl1Cntl));
+	const uint32_t utcl1Page = rdGc(sdma(0, SdmaUtcl1Page));
+	const uint32_t mcu = rdGc(sdma(0, SdmaMcuCntl));
+	const uint32_t doorbellOffset = sdmaDoorbell ? rdGc(sdma(0, SdmaQ0DoorbellOffset)) : 0;
+	const uint32_t nbifDoorbell = sdmaDoorbell ? rd(IpDiscovery::HwNbif, NbifS2aDoorbell2) : 0;
+	if (rb == kBad || ib == kBad || db == kBad || watchdog == kBad ||
+	    utcl1Cntl == kBad || utcl1Page == kBad || mcu == kBad ||
+	    (sdmaDoorbell && (doorbellOffset == kBad || nbifDoorbell == kBad))) {
+		CLOG("sdma: queue register preflight failed (RB 0x%08x IB 0x%08x DB 0x%08x watchdog 0x%08x UTCL1 0x%08x/0x%08x MCU 0x%08x doorbell-offset 0x%08x NBIF 0x%08x); refusing queue programming",
+		     rb, ib, db, watchdog, utcl1Cntl, utcl1Page, mcu, doorbellOffset, nbifDoorbell);
 		return false;
 	}
 	rb = (rb & ~(kSdmaRbSizeMask | kSdmaRbEnable)) | (sizeLog2 << kSdmaRbSizeShift) | kSdmaRbPriv;
@@ -2651,33 +2665,27 @@ bool RDNA4Compute::sdmaQueueInit() {
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), static_cast<uint32_t>(sdmaStartPtr >> 32));
 	// sdma_v7_0 always uses a doorbell (use_doorbell = true): SDMA0 on
 	// dword kSdmaDoorbellDword, routed by NBIF S2A entry 2.
-	const uint32_t db = rdGc(sdma(0, SdmaQ0Doorbell));
 	if (sdmaDoorbell) {
 		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell), db | kSdmaDoorbellEnable);
 		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0DoorbellOffset),
-		   (rdGc(sdma(0, SdmaQ0DoorbellOffset)) & ~(0x3ffffffu << 2)) | (kSdmaDoorbellDword << 2));
+		   (doorbellOffset & ~(0x3ffffffu << 2)) | (kSdmaDoorbellDword << 2));
 		wr(IpDiscovery::HwNbif, NbifS2aDoorbell2,
-		   (rd(IpDiscovery::HwNbif, NbifS2aDoorbell2) & ~kS2aDoorbell2Mask) | kS2aDoorbell2Sdma);
+		   (nbifDoorbell & ~kS2aDoorbell2Mask) | kS2aDoorbell2Sdma);
 	} else {
 		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell), db & ~kSdmaDoorbellEnable);
 	}
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 0);
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaWatchdogCntl),
-	   (rdGc(sdma(0, SdmaWatchdogCntl)) & ~kSdmaWatchdogHangMask) | 1);
+	   (watchdog & ~kSdmaWatchdogHangMask) | 1);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Cntl),
-	   (rdGc(sdma(0, SdmaUtcl1Cntl)) & ~(kSdmaUtcl1RespMask | kSdmaUtcl1RedoMask)) | (3u << 9) | 9);
+	   (utcl1Cntl & ~(kSdmaUtcl1RespMask | kSdmaUtcl1RedoMask)) | (3u << 9) | 9);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Page),
-	   (rdGc(sdma(0, SdmaUtcl1Page)) & kSdmaUtcl1PagePolicyKeep) | kSdmaUtcl1PagePolicy);
+	   (utcl1Page & kSdmaUtcl1PagePolicyKeep) | kSdmaUtcl1PagePolicy);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaMcuCntl),
-	   rdGc(sdma(0, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
+	   mcu & ~(kSdmaMcuHalt | kSdmaMcuReset));
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb | kSdmaRbEnable);
-	const uint32_t ib = rdGc(sdma(0, SdmaQ0IbCntl));
-	if (ib == kBad) {
-		CLOG("sdma: SDMA0 IB control is inaccessible during queue enable");
-		return false;
-	}
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0IbCntl), ib | kSdmaIbEnable);
 
 	// Read back the state that makes the queue capable of accepting work.
