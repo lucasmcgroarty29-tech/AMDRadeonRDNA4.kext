@@ -2762,12 +2762,29 @@ bool RDNA4Compute::stageSdma() {
 	if (resumePending) {
 		const uint32_t rl = rdGc(sdma(0, SdmaQ0RbRptr)), rh = rdGc(sdma(0, SdmaQ0RbRptrHi));
 		const uint32_t wl = rdGc(sdma(0, SdmaQ0RbWptr)), wh = rdGc(sdma(0, SdmaQ0RbWptrHi));
-		if (rl != kBad && rh != kBad && wl != kBad && wh != kBad) {
-			const uint64_t rp = (static_cast<uint64_t>(rh) << 32) | rl, wp = (static_cast<uint64_t>(wh) << 32) | wl;
-			startPtr = (rp > wp ? rp : wp) & ~3ull;
-			CLOG("sdma: resume without a power loss? engine pointers rptr 0x%llx wptr 0x%llx: the ring resumes at 0x%llx (0 = the engine was reset)",
-			     static_cast<unsigned long long>(rp), static_cast<unsigned long long>(wp), static_cast<unsigned long long>(startPtr));
+		if (rl == kBad || rh == kBad || wl == kBad || wh == kBad) {
+			sdmaQuarantined = resumeQuarantined = true;
+			CLOG("sdma: resume pointer read failed (rptr 0x%08x:0x%08x, wptr 0x%08x:0x%08x); refusing to clear or reuse the ring",
+			     rh, rl, wh, wl);
+			publish();
+			return false;
 		}
+		const uint64_t rp = (static_cast<uint64_t>(rh) << 32) | rl;
+		const uint64_t wp = (static_cast<uint64_t>(wh) << 32) | wl;
+		// The ring is disabled during sleep. A safe restart requires proof that
+		// every submitted byte was consumed before the ring backing is cleared.
+		// Do not round pointers down or take their maximum: either can conceal
+		// a stale, corrupt, or partially consumed queue.
+		if ((rp & 3) || (wp & 3) || rp != wp) {
+			sdmaQuarantined = resumeQuarantined = true;
+			CLOG("sdma: resume pointers are not a drained, aligned pair (rptr 0x%llx wptr 0x%llx); retaining the old ring",
+			     static_cast<unsigned long long>(rp), static_cast<unsigned long long>(wp));
+			publish();
+			return false;
+		}
+		startPtr = rp;
+		CLOG("sdma: resume pointer pair verified drained at 0x%llx",
+		     static_cast<unsigned long long>(startPtr));
 	}
 	sdmaStartPtr = startPtr;
 	Sdma::Ring &ring = sdmaRing;              // kept: the runtime's DMA uses it
