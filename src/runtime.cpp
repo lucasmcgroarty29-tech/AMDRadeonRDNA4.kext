@@ -313,8 +313,9 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         // W27: GFXOFF is lifted before the first GC access of the quiesce (this also clears
         // the persistent flag). If it cannot be lifted every GC access below is dropped.
         bootQueueLive = false;
-        gcSnapValid = false;	rdna4Step("quiesce: lifting GFXOFF (gcWake)");
-	gcWake(0xfffffffeu);
+        gcSnapValid = false;
+        rdna4Step("quiesce: lifting GFXOFF (gcWake)");
+        gcWake(0xfffffffeu);
 	if (gcState == kGcHold) {
 		// No GC register access is safe after a failed wake. Keep every GPU-
 		// reachable allocation and the AGP aperture intact; the PCI bus-master
@@ -325,9 +326,7 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
 		RLOG("quiesce: GC wake failed; skipping all GC teardown and retaining DMA/runtime allocations");
 		return;
 	}
-	rdna4Step("quiesce: interrupts off");
-        if (gcState == kGcHold)
-                CLOG("quiesce: GFXOFF could not be lifted; the GC quiesce steps are dropped and engines may keep running");
+        rdna4Step("quiesce: interrupts off");
         if (ihActive)
                 ihStop();
         const uint32_t ih = rd(IpDiscovery::HwOsssys, kQuiesceIhRbCntl);
