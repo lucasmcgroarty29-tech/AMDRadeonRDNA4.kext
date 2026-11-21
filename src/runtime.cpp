@@ -770,29 +770,36 @@ bool RDNA4Compute::initRuntimeHeap() {
 	return heap.size() != 0;
 }
 
-void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
-	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
-		return;   // (the last: the round-up would wrap)
+bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
+	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) ||
+	    bytes > ~0ull - (GpuVm::kPageBytes - 1))
+		return false;   // (the last: the round-up would wrap)
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	if (end < va)
+		return false;
 	if (c.sp) {
 		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		GpuVmTable::treeUnmap(tree, va, end);
 		if (!sparseSync(c))
 			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
-		return;
+		return !c.sp || sparseSync(c);
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
-	if (span.firstPt != ~0ull && c.tableCpu)
-		(void)vmSyncCpu(c, va, end);
-	else if (span.firstPt != ~0ull && !vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000)))
+	if (span.firstPt == ~0ull)
+		return true;
+	if (c.tableCpu)
+		return vmSyncCpu(c, va, end);
+	if (!vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000))) {
 		RLOG("vmid %u: page-table unmap sync failed", c.vmid);   // one SDMA job for the span, as vmMapHost
+		return false;
+	}
+	return true;
 }
-
 /* Tables in the pool (rtPreferCpuTables): only the entries of [va, end) copied through the BAR, its PDB0 entries and its PTEs (the dense
  * layout keeps both in VA order within a GiB), then HDP flushed. Whole pages were 16 KiB of uncached BAR writes for a mapping of a few dozen pages. */
 bool RDNA4Compute::vmSyncCpu(RtClient &c, uint64_t va, uint64_t end) {
