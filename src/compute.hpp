@@ -898,6 +898,7 @@ private:
 		uint32_t gfxFence { 0 };
 		uint32_t gfxFences[kMaxGfxIbOutstanding] {};
 		uint32_t gfxOutstanding { 0 };
+		bool gfxQuarantined { false };   // gfx ring wedged while this client's IBs may still be in flight
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
