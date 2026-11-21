@@ -639,6 +639,7 @@ bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
 void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 	if (!c.sp)
 		return;
+	bool vramCleared = !clearVram;
 	if (clearVram) {
 		for (uint32_t id = 0; id < c.sp->s.idCount(); id++) {
 			uint64_t *shadow = nullptr, heapOffset = 0;
@@ -647,9 +648,15 @@ void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 			bzero(shadow, 0x1000);
 			c.sp->s.markDirty(id);
 		}
-		(void)sparseSync(c);
+		vramCleared = sparseSync(c);
+		if (!vramCleared)
+			RLOG("vmid %u: sparse page-table clear failed; retaining VRAM chunks to prevent stale tables being reused", c.vmid);
 	}
-	c.sp->s.releaseAll(sparseHost(), clearVram);
+	/* Never return a chunk to the heap unless its old page-table contents
+	 * were cleared successfully. On failure we intentionally leak the VRAM
+	 * allocation until the next GPU reset rather than let another client
+	 * inherit stale PDEs/PTEs. Host shadow pages can still be released. */
+	c.sp->s.releaseAll(sparseHost(), vramCleared);
 	IOFree(c.sp, sizeof(SparseTables));
 	c.sp = nullptr;
 	c.rootMc = c.rootPhys = 0;
