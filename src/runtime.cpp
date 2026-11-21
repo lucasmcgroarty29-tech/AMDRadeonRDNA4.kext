@@ -4780,12 +4780,25 @@ bool RDNA4Compute::bounceCopy(uint64_t vram, uint32_t hostOffset, uint32_t bytes
 // to the largest free hole of the MC space; here it grows on demand from the bounce buffer's end. False without DMA, or with an IOMMU in between
 // (the bounce buffer's bus address then differs from its physical one, and a bus address names no fixed memory). Caller holds rtLock.
 bool RDNA4Compute::agpReach(uint64_t busEnd) {
-	if (!dmaReady || !busEnd || bounceBus != bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone))
+	constexpr uint64_t kMcAddressLimit = 1ull << 48;
+	constexpr uint64_t kApertureGranule = 1ull << 30;
+	if (!dmaReady || !bounce || !busEnd ||
+	    bounceBus != bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) ||
+	    agpStart >= kMcAddressLimit || busEnd > kMcAddressLimit - agpStart)
 		return false;
-	if (agpStart + busEnd - 1 <= agpEnd)
+	const uint64_t requestedEnd = agpStart + busEnd - 1;
+	if (requestedEnd < agpStart || requestedEnd >= kMcAddressLimit)
+		return false;
+	if (requestedEnd <= agpEnd)
 		return true;
-	const uint64_t end = agpStart + ((busEnd + (1ull << 30) - 1) & ~((1ull << 30) - 1)) - 1;
-	if (end >= (1ull << 48))
+	if (busEnd > UINT64_MAX - (kApertureGranule - 1))
+		return false;
+	const uint64_t roundedBusEnd =
+		(busEnd + kApertureGranule - 1) & ~(kApertureGranule - 1);
+	if (!roundedBusEnd || roundedBusEnd > kMcAddressLimit - agpStart)
+		return false;
+	const uint64_t end = agpStart + roundedBusEnd - 1;
+	if (end >= kMcAddressLimit)
 		return false;
 	wr(IpDiscovery::HwGc, GcAgpTop, static_cast<uint32_t>(end >> 24));
 	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(end >> 18));
@@ -4818,7 +4831,7 @@ bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
 // M2: one CONST_FILL / COPY_LINEAR on system memory by bus address (pvgpu.cpp runs the fake paravirtual GPU's blits with these).
 bool RDNA4Compute::sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes) {
 	Locked g(rtLock);
-	if (!bytes || !agpReach(bus + bytes))
+	if (!bytes || bus > UINT64_MAX - bytes || !agpReach(bus + bytes))
 		return false;
 	uint32_t pkt[Sdma::kFillDwords];
 	Sdma::constFill(pkt, agpStart + bus, pattern, bytes);
@@ -4827,7 +4840,8 @@ bool RDNA4Compute::sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes) {
 
 bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
 	Locked g(rtLock);
-	if (!bytes || !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
+	if (!bytes || srcBus > UINT64_MAX - bytes || dstBus > UINT64_MAX - bytes ||
+	    !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
 		return false;
 	uint32_t pkt[Sdma::kCopyDwords];
 	Sdma::copyLinear(pkt, agpStart + srcBus, agpStart + dstBus, bytes);
