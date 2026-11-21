@@ -1946,6 +1946,12 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	    !vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !c->pm4.init(poolDw(qoff + kVmPq), qva, kPqSize) || !vmContextInit(*c)) {
+		if (c->mapQuarantined) {
+			c->active = true;
+			c->aborted = true;
+			RLOG("vmid %u: failed client open retained after unsafe page-table rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
@@ -2053,6 +2059,12 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || (rdna4Step("rtOpenShared: VM context"), !vmContextInit(*c))) {
+		if (c->mapQuarantined) {
+			c->active = true;
+			c->aborted = true;
+			RLOG("vmid %u: failed shared open retained after unsafe page-table rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		IOFree(c->tableShadow, kVmTableBytes); freeTable(); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
@@ -2115,6 +2127,12 @@ IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(c->poolOff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(c->poolOff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(c->poolOff + kVmIb), 0x1000, true)) {
+		if (c->mapQuarantined) {
+			c->active = true;
+			c->aborted = true;
+			RLOG("PASID %u: failed pooled open retained after unsafe page-table rollback", c->pasid);
+			return kIOReturnNotResponding;
+		}
 		sparseTeardown(*c, true);
 		*c = RtClient {};
 		return kIOReturnNoMemory;
