@@ -3370,9 +3370,10 @@ static int testSdmaPackets() {
 	failures += check(Sdma::writeDword(p, a, 0xDEADBEEF) == 5 && p[0] == 0x00000002 &&
 	                  p[1] == 0x09002000 && p[2] == 0x80 && p[3] == 0 && p[4] == 0xDEADBEEF,
 	                  "sdma: WRITE_LINEAR %08x %08x %08x %08x %08x", p[0], p[1], p[2], p[3], p[4]);
-	failures += check(Sdma::fence(p, a + 0x41, 7) == 4 && p[0] == 0x00030005 &&
+	failures += check(Sdma::fence(p, a + 0x40, 7) == 4 && p[0] == 0x00030005 &&
 	                  p[1] == 0x09002040 && p[2] == 0x80 && p[3] == 7,
 	                  "sdma: FENCE %08x %08x %08x %08x", p[0], p[1], p[2], p[3]);
+	failures += check(!Sdma::fence(p, a + 0x41, 7), "sdma: unaligned FENCE address silently rounded down");
 	failures += check(Sdma::constFill(p, b, 0x5A5AC0DE, 1u << 20) == 5 && p[0] == 0x8000000b &&
 	                  p[1] == 0x10000000 && p[2] == 0x80 && p[3] == 0x5A5AC0DE && p[4] == 0xfffff,
 	                  "sdma: CONST_FILL %08x .. %08x", p[0], p[4]);
@@ -3381,12 +3382,24 @@ static int testSdmaPackets() {
 	                  "sdma: COPY_LINEAR %08x %08x", p[0], p[1]);
 	failures += check(Sdma::trap(p) == Sdma::kTrapDwords && p[0] == 0x00000006 && p[1] == 0,
 	                  "sdma: TRAP %08x %08x", p[0], p[1]);
+	failures += check(Sdma::constFill(p, b, 0, 0x400000) == Sdma::kFillDwords &&
+	                  p[4] == 0x003fffff, "sdma: maximum 4 MiB CONST_FILL accepted");
+	failures += check(!Sdma::constFill(p, b, 0, 0) && !Sdma::constFill(p, b, 0, 0x400004) &&
+	                  !Sdma::constFill(p, b + 1, 0, 4), "sdma: invalid CONST_FILL accepted");
+	failures += check(Sdma::copyLinear(p, a, b, 0x400000) == Sdma::kCopyDwords &&
+	                  p[1] == 0x003fffff, "sdma: maximum 4 MiB COPY_LINEAR accepted");
+	failures += check(!Sdma::copyLinear(p, a, b, 0) && !Sdma::copyLinear(p, a, b, 0x400001) &&
+	                  !Sdma::copyLinear(p, UINT64_MAX - 1, b, 4), "sdma: invalid COPY_LINEAR accepted");
+	failures += check(!Sdma::writeDword(p, a + 1, 1) && !Sdma::fence(p, UINT64_MAX - 1, 1),
+	                  "sdma: invalid WRITE/FENCE address accepted");
+	failures += check(!Sdma::indirect(p, a + 1, 8, 1) && !Sdma::indirect(p, a, 7, 1) &&
+	                  !Sdma::indirect(p, a, 8, 16), "sdma: invalid INDIRECT parameters accepted");
 	// A command buffer run in another address space (SDMA_OP_INDIRECT 4, the VMID at bit 16, the buffer 32-byte
 	// aligned), and the padding that makes the packet end on an 8-dword boundary of the ring.
 	bool padded = true;
 	for (uint32_t dw = 0; dw < 64; dw++)
 		padded &= Sdma::indirectPad(dw * 4) < 8 && (dw + Sdma::indirectPad(dw * 4) + Sdma::kIndirectDwords) % 8 == 0;
-	failures += check(Sdma::indirect(p, 0xffff80000000101full, 8, 8) == 6 && p[0] == 0x00080004 && p[1] == 0x00001000 &&
+	failures += check(Sdma::indirect(p, 0xffff800000001020ull, 8, 8) == 6 && p[0] == 0x00080004 && p[1] == 0x00001020 &&
 	                  p[2] == 0xffff8000 && p[3] == 8 && p[4] == 0 && p[5] == 0 && padded,
 	                  "sdma: INDIRECT %08x %08x %08x %08x, ends on an 8-dword boundary from any write pointer", p[0], p[1],
 	                  p[2], p[3]);
@@ -3403,6 +3416,25 @@ static int testSdmaPackets() {
 	failures += check(ok && r.wptr() == 20 * 5 * 4 && mem[((19 * 5 + 4) * 4 % 256) / 4] == 19,
 	                  "sdma: ring wrap (wptr %llu)", static_cast<unsigned long long>(r.wptr()));
 	failures += check(!r.init(mem, 0x8008800010ull, sizeof(mem)), "sdma: unaligned ring accepted");
+	{
+		uint32_t large[128];
+		Sdma::Ring overflow;
+		failures += check(!overflow.init(large, UINT64_MAX - 0xffull, sizeof(large)),
+		                  "sdma: overflowing GPU ring range accepted");
+	}
+	failures += check(!r.init(mem, 0x8008800000ull, sizeof(mem), 0x17607), "sdma: unaligned resume pointer accepted");
+	const uint64_t beforeBadEmits = r.wptr();
+	failures += check(!r.emit(nullptr, 1) && !r.emit(p, 0) && !r.emit(p, UINT32_MAX) &&
+	                  r.wptr() == beforeBadEmits, "sdma: invalid or overflowing packet length changed ring");
+	{
+		uint32_t rm[64];
+		Sdma::Ring edge;
+		const uint64_t nearWrap = UINT64_MAX - 3;
+		ok = edge.init(rm, 0x8008800000ull, sizeof(rm), nearWrap);
+		const uint32_t one = 0xdeadbeef;
+		ok = ok && !edge.emit(&one, 1) && edge.wptr() == nearWrap;
+		failures += check(ok, "sdma: write pointer overflow rejected without modifying it");
+	}
 	// P7: a ring that RESUMES at the engine's own 64-bit pointers (a wake without power loss): the wptr continues monotonically from there and the packets
 	// land at the pointer modulo the ring size.
 	{
@@ -3413,7 +3445,8 @@ static int testSdmaPackets() {
 		ok = ok && rr.emit(p, Sdma::writeDword(p, a, 0x77)) && rr.wptr() == start + 5 * 4;
 		failures += check(ok && rm[(start & 255) / 4] == p[0] && rr.wptr() > start,
 		                  "sdma: ring resumed at the engine's pointers (wptr 0x%llx)", static_cast<unsigned long long>(rr.wptr()));
-		failures += check(rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == 0x17604, "sdma: a resume pointer is dword aligned");
+		failures += check(!rr.init(rm, 0x8008800000ull, sizeof(rm), 0x17607) && rr.wptr() == start + 5 * 4,
+		                  "sdma: unaligned resume pointer rejected without changing the live ring");
 	}
 
 	printf("\nsdma: WRITE_LINEAR/FENCE/CONST_FILL/COPY_LINEAR/INDIRECT encodings and ring wrap %s\n",
@@ -4192,6 +4225,20 @@ static int testVmidPool() {
 	f += check(pool.grab(15, 0x15000, 0, g) == Result::Ok && g.stolen && g.vmid != 8,
 	           "vmid: the 15th owner steals an idle VMID; the reserved one stays out");
 
+	// An invalidate timeout makes a VMID unsafe to hand to another address space. It is
+	// retired like a pin, but unlike an ordinary pin it has no owner and cannot be reused.
+	pool.init(fakeReached, &fences);
+	fences = FakeFences {};
+	f += check(pool.grab(1, 0x1000, 0, g) == Result::Ok, "vmid quarantine: initial allocation");
+	const uint32_t retired = g.vmid;
+	pool.quarantine(retired);
+	f += check(pool.ownerOf(retired) == 0 && pool.pinned(retired) &&
+	           pool.grab(2, 0x2000, 0, g) == Result::Ok && g.vmid != retired,
+	           "vmid quarantine: retired VMID is ownerless and never reallocated");
+	pool.unbindAll();
+	f += check(!pool.pinned(retired) && pool.grab(3, 0x3000, 0, g) == Result::Ok,
+	           "vmid quarantine: a GPU reset clears retired VMIDs");
+
 	// unbindAll (wake / GPU reset): nothing is bound any more, pins included.
 	pool.unbindAll();
 	bool none = true;
@@ -4275,6 +4322,30 @@ static int testPtPages() {
 	q.init(3);
 	bool three = q.page(0, b2, off) && q.page(1, b2, off) && q.page(2, b2, off);
 	f += check(three && !q.page(3, b2, off) && q.pages() == 3 && !q.has(3), "ptpages: the quota refuses the 4th page and leaves no trace");
+	PtPages::Table misaligned;
+	FakeChunks badChunk;
+	badChunk.next = 0x1000001;
+	PtPages::Backend badBackend { fakeAllocChunk, fakeFreeChunk, &badChunk };
+	misaligned.init(PtPages::kMaxPages);
+	f += check(!misaligned.page(0, badBackend, off) && misaligned.pages() == 0 &&
+	           misaligned.chunksHeld() == 0 && badChunk.allocs == 1 && badChunk.frees == 1 &&
+	           badChunk.live == 0,
+	           "ptpages: a misaligned backend chunk is returned immediately and never recorded");
+
+	PtPages::Table overlap;
+	FakeChunks duplicateChunk;
+	PtPages::Backend duplicateBackend { fakeAllocChunk, fakeFreeChunk, &duplicateChunk };
+	overlap.init(PtPages::kMaxPages);
+	bool firstChunk = true;
+	for (uint32_t i = 0; i < PtPages::kChunkPages; i++)
+		firstChunk &= overlap.page(i, duplicateBackend, off);
+	duplicateChunk.next = 0x1000000;  // malicious allocator returns the already-live chunk again
+	f += check(firstChunk && !overlap.page(PtPages::kChunkPages, duplicateBackend, off) &&
+	           overlap.pages() == PtPages::kChunkPages && overlap.chunksHeld() == 1 &&
+	           duplicateChunk.live == 1 && duplicateChunk.frees == 1,
+	           "ptpages: an overlapping allocator result is freed without aliasing a live page-table chunk");
+	overlap.release(duplicateBackend);
+
 	PtPages::Table r;
 	FakeChunks c3;
 	c3.failAfter = 1;
@@ -4457,7 +4528,7 @@ struct Pair {
 	void setFailSync(bool f) { ref.failSync = nw.failSync = f; }
 
 	// After one operation: same result, same syncs, same bytes.
-	void compare(const char *what, bool rr, bool rn) {
+	void compare(const char *what, bool rr, bool rn, bool compareState = true) {
 		ops++;
 		auto fail = [&](const char *why) {
 			if (failures < 5)
@@ -4466,16 +4537,26 @@ struct Pair {
 		};
 		if (rr != rn)
 			fail("return value differs from the pre-S8 code");
-		if (ref.syncs != nw.syncs)
-			fail("the PT pages handed to vmTableSync differ");
-		if (memcmp(refWords.data(), nw.words.data(), kTableBytes) != 0) {
-			uint64_t i = 0;
-			while (refWords[i] == nw.words[i])
-				i++;
-			char buf[160];
-			snprintf(buf, sizeof(buf), "image differs at byte 0x%llx: old 0x%016llx new 0x%016llx", (unsigned long long)(i * 8),
-			         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
-			fail(buf);
+		/* Invalid host-page lists intentionally have different failure atomicity:
+		 * pre-S8 could write a valid prefix before rejecting a later bad page,
+		 * while the new implementation must leave the image untouched. Those
+		 * cases are covered by dedicated no-prefix-mutation regression tests. */
+		if (compareState) {
+			if (ref.syncs != nw.syncs)
+				fail("the PT pages handed to vmTableSync differ");
+			if (memcmp(refWords.data(), nw.words.data(), kTableBytes) != 0) {
+				uint64_t i = 0;
+				while (refWords[i] == nw.words[i])
+					i++;
+				char buf[160];
+				snprintf(buf, sizeof(buf), "image differs at byte 0x%llx: old 0x%016llx new 0x%016llx", (unsigned long long)(i * 8),
+				         (unsigned long long)refWords[i], (unsigned long long)nw.words[i]);
+				fail(buf);
+			}
+		} else {
+			/* Rebase the legacy oracle after an intentionally different failure
+			 * path so later fuzz operations compare from the same starting image. */
+			memcpy(refWords.data(), nw.words.data(), kTableBytes);
 		}
 		ref.syncs.clear();
 		nw.syncs.clear();
@@ -4497,7 +4578,13 @@ struct Pair {
 		const bool a = !beyondDense(va, bytes) && legacyVmMapHost(ref, va, buses.data(), bytes, exec),
 		           b = newVmMapHost(nw, va, buses.data(), bytes, exec);
 		(a ? okHost : failedHost)++;
-		compare("mapHost", a, b);
+		bool validPages = bytes && bytes <= ~0ull - (GpuVm::kPageBytes - 1);
+		const uint64_t rounded = validPages ? (bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1) : 0;
+		const uint64_t pageCount = rounded / GpuVm::kPageBytes;
+		validPages = validPages && pageCount <= buses.size();
+		for (uint64_t i = 0; validPages && i < pageCount; i++)
+			validPages = !(buses[i] & (GpuVm::kPageBytes - 1)) && buses[i] <= GpuVm::kPhysicalMask;
+		compare("mapHost", a, b, validPages);
 	}
 	// The new code stops unmapping at the end of the dense image, as map() refuses past it; the pre-S8 code clears and syncs
 	// table pages beyond (0x203000 and up), so it is given only the part of the range below the end.
@@ -4763,6 +4850,50 @@ static int testDense4GiB() {
 	f += check(resolves(V + 0x1000, MC, 0x3000) && resolves(V + G - 0x10000, MC + 0x100000, 0x20000), "dense: the earlier maps are undisturbed");
 	f += check(!map(V + 4 * G - 0x1000, MC, 0x2000), "dense: a map past 4 GiB is refused");
 	f += check(GpuVmTable::denseVa(4u << 20) == G, "dense: a 4 MiB image still covers only the first GiB");
+
+	/* A late accessor failure must be discovered before either dense mapper
+	 * writes the valid prefix. */
+	{
+		struct FaultAccess { uint64_t *words; uint64_t failOffset; };
+		static std::vector<uint64_t> faultWords;
+		faultWords.assign(GpuVmTable::kDenseTableBytes / 8, 0);
+		auto faultEntry = [](void *ctx, uint64_t off) -> uint64_t * {
+			auto *f = static_cast<FaultAccess *>(ctx);
+			return off == f->failOffset || off >= GpuVmTable::kDenseTableBytes
+			           ? nullptr : f->words + off / 8;
+		};
+		auto faultPhys = [](void *ctx, uint64_t off, uint64_t &out) {
+			auto *f = static_cast<FaultAccess *>(ctx);
+			if (off == f->failOffset || off >= GpuVmTable::kDenseTableBytes)
+				return false;
+			out = kRootPhys + off;
+			return true;
+		};
+		const uint64_t start = V + 0x800000;
+		const uint64_t end = start + 0x2000;
+		FaultAccess fault { faultWords.data(), GpuVmTable::densePte(start + 0x1000) };
+		const GpuVmTable::Access faultTable { faultEntry, faultPhys, &fault };
+		GpuVmTable::Span span;
+		const bool vramMapped = GpuVmTable::mapVram(faultTable, GpuVmTable::Policy {},
+		                                             GpuVmTable::kDenseTableBytes, start, end,
+		                                             0x200000, false, span);
+		bool vramUntouched = true;
+		for (uint64_t word : faultWords)
+			vramUntouched &= word == 0;
+		f += check(!vramMapped && vramUntouched,
+		           "dense: a late missing PTE accessor leaves the complete VRAM mapping untouched");
+
+		fault.failOffset = GpuVmTable::densePte(start + 0x1000);
+		const uint64_t buses[2] = { 0x104000000ull, 0x104001000ull };
+		const bool hostMapped = GpuVmTable::mapHost(faultTable, GpuVmTable::Policy {},
+		                                             GpuVmTable::kDenseTableBytes, start, end,
+		                                             buses, false, span);
+		bool hostUntouched = true;
+		for (uint64_t word : faultWords)
+			hostUntouched &= word == 0;
+		f += check(!hostMapped && hostUntouched,
+		           "dense: a late missing host PTE accessor leaves the complete host mapping untouched");
+	}
 	return f;
 }
 
@@ -4827,6 +4958,26 @@ static int testSparseTree() {
 	const uint64_t top = GpuVm::kVaEnd - 0x2000;
 	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
 	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	{
+		const uint32_t pagesBeforeInvalid = e.sp.pages();
+		const uint64_t lastPage = GpuVm::kVaEnd - GpuVm::kPageBytes;
+		uint64_t lastPageBefore = 0;
+		const bool lastPageWasMapped = e.translate(lastPage, lastPageBefore);
+		const bool pastEnd = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, lastPage,
+		                                             GpuVm::kVaEnd + GpuVm::kPageBytes, 0x100000, false);
+		const bool physicalOverflow = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x100000,
+		                                                       V + 0x101000, GpuVm::kPhysicalMask + GpuVm::kPageBytes, false);
+		const bool physicalMisaligned = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x102000,
+		                                                         V + 0x103000, 0x100001, false);
+		/* The final page was deliberately mapped by the top-of-VA test above.
+		 * A rejected range must preserve that existing translation, not make it
+		 * disappear; checking for an unmapped page here tested the wrong thing. */
+		f += check(lastPageWasMapped, "tree: top-of-VA fixture maps the final page before invalid-range checks");
+		f += check(!pastEnd && !physicalOverflow && !physicalMisaligned && e.sp.pages() == pagesBeforeInvalid,
+		           "tree: invalid VA tail, out-of-range physical page and misaligned physical address are rejected before allocation");
+		f += check(e.translate(lastPage, phys) && phys == lastPageBefore,
+		           "tree: rejected ranges preserve the existing final-page translation");
+	}
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
 	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
@@ -4855,8 +5006,17 @@ static int testSparseTree() {
 		e.sync();
 		f += check(hm2 && e.translate(hv2, phys) && phys == buses[0] && e.translate(hv2 + 0x1000, phys) && phys == buses[1],
 		           "tree: a later host mapping into an existing PT page reaches VRAM");
-		buses[3] |= 0x40;
-		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, hv + 0x20000, hv + 0x28000, buses.data(), false), "tree: a misaligned bus address is refused");
+		const uint64_t badVa = hv + 0x20000;
+		const uint32_t pagesBeforeBadMap = e.sp.pages();
+		buses[7] = GpuVm::kPhysicalMask + GpuVm::kPageBytes;  // aligned, but outside gfx12's physical-address field
+		const bool badRange = GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false);
+		e.sync();
+		f += check(!badRange && e.sp.pages() == pagesBeforeBadMap && !e.translate(badVa, phys) &&
+		           !e.translate(badVa + 0x6000, phys),
+		           "tree: a bad final bus address rejects the whole range before mapping its valid prefix");
+		buses[3] = 0x104048000ull + 0x3000ull * 3 | 0x40;
+		f += check(!GpuVmTable::treeMapHost(e.tree(), GpuVmTable::Policy {}, badVa, badVa + 0x8000, buses.data(), false),
+		           "tree: a misaligned bus address is refused");
 	}
 
 	// Quota: the VA limit is the page quota. Nothing half-made, earlier mappings survive.

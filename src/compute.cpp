@@ -581,9 +581,31 @@ void RDNA4Compute::resumeMain(void *arg, wait_result_t) {
 		return;
 	}
 	const bool stopped = !self->bringupStepAllowed("resume reset");
-	if (!stopped)
-	self->resetRuntimeForResume();
-	if (!stopped)
+	bool retainOldRuntime = false;
+	if (!stopped && self->rtLock) {
+		IOLockLock(self->rtLock);
+		retainOldRuntime = self->resumeQuarantined;
+		if (retainOldRuntime) {
+			for (RtClient &client : self->clients)
+				if (client.active)
+					client.mapQuarantined = client.aborted = true;
+		}
+		IOLockUnlock(self->rtLock);
+	}
+	if (!stopped && !retainOldRuntime) {
+		self->resetRuntimeForResume();
+		// resetRuntimeForResume can discover a failed context-disable or TLB
+		// acknowledgement. Do not let later bring-up stages reuse the pool
+		// while those old allocations are deliberately being retained.
+		if (self->rtLock) {
+			IOLockLock(self->rtLock);
+			retainOldRuntime = self->resumeQuarantined;
+			IOLockUnlock(self->rtLock);
+		}
+	}
+	if (retainOldRuntime)
+		CLOG("power: wake could not prove all queues and VM translations quiescent; preserving old heaps, buffers, programs and page tables; compute runtime remains offline");
+	if (!stopped && !retainOldRuntime)
 		self->runStages();
 	self->endBringup();
 	if (self->rtLock) {
@@ -2483,20 +2505,34 @@ void RDNA4Compute::logGcFault(const char *tag) {
 // register is written; the RS64 firmware's init (UCODE_INIT_DONE) may reset
 // the queue context, so the queue is programmed after it.
 bool RDNA4Compute::sdmaStartMcus() {
-	for (uint32_t i = 0; i < kSdmaInstances; i++)
+	// Both instances must finish firmware initialisation before queue 0 is
+	// programmed. A successful SDMA0 status says nothing about SDMA1.
+	for (uint32_t i = 0; i < kSdmaInstances; i++) {
+		const uint32_t control = rdGc(sdma(i, SdmaMcuCntl));
+		if (control == kBad) {
+			CLOG("sdma: SDMA%u MCU control is inaccessible; refusing queue bring-up", i);
+			return false;
+		}
 		wr(IpDiscovery::HwGc, sdma(i, SdmaMcuCntl),
-		   rdGc(sdma(i, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
-	uint32_t s0 = 0;
-	for (uint32_t ms = 0; ms < 100; ms++) {
-		s0 = rdGc(sdma(0, SdmaStatusReg));
-		if (s0 != kBad && (s0 & kSdmaUcodeInitDone))
-			break;
-		IOSleep(1);
+		   control & ~(kSdmaMcuHalt | kSdmaMcuReset));
 	}
-	const uint32_t s1 = rdGc(sdma(1, SdmaStatusReg));
-	CLOG("sdma: MCUs unhalted: SDMA0 status 0x%08x (ucode init %s), SDMA1 status 0x%08x", s0,
-	     (s0 & kSdmaUcodeInitDone) ? "done" : "NOT done", s1);
-	return s0 != kBad && (s0 & kSdmaUcodeInitDone);
+	bool ready = true;
+	for (uint32_t i = 0; i < kSdmaInstances; i++) {
+		uint32_t status = kBad;
+		for (uint32_t ms = 0; ms < 100; ms++) {
+			status = rdGc(sdma(i, SdmaStatusReg));
+			if (status != kBad && (status & kSdmaUcodeInitDone))
+				break;
+			IOSleep(1);
+		}
+		if (status == kBad || !(status & kSdmaUcodeInitDone)) {
+			ready = false;
+			CLOG("sdma: SDMA%u firmware did not become ready (status 0x%08x)", i, status);
+		} else {
+			CLOG("sdma: SDMA%u firmware ready (status 0x%08x)", i, status);
+		}
+	}
+	return ready;
 }
 
 // gmc_v12_0_flush_vm_hub for VMID0 on the GC hub (engine 17, no semaphore).
@@ -2587,7 +2623,25 @@ void RDNA4Compute::cpConfigRs64() {
 bool RDNA4Compute::sdmaQueueInit() {
 	const uint64_t ring = poolMc(kSdmaRingOffset);
 	const uint32_t sizeLog2 = 10;   // 4 KiB = 1024 dwords
+	// Read every register whose existing bits must be preserved before the
+	// first queue write. An all-ones MMIO failure sentinel must never become
+	// the input to a read/modify/write operation.
 	uint32_t rb = rdGc(sdma(0, SdmaQ0RbCntl));
+	const uint32_t ib = rdGc(sdma(0, SdmaQ0IbCntl));
+	const uint32_t db = rdGc(sdma(0, SdmaQ0Doorbell));
+	const uint32_t watchdog = rdGc(sdma(0, SdmaWatchdogCntl));
+	const uint32_t utcl1Cntl = rdGc(sdma(0, SdmaUtcl1Cntl));
+	const uint32_t utcl1Page = rdGc(sdma(0, SdmaUtcl1Page));
+	const uint32_t mcu = rdGc(sdma(0, SdmaMcuCntl));
+	const uint32_t doorbellOffset = sdmaDoorbell ? rdGc(sdma(0, SdmaQ0DoorbellOffset)) : 0;
+	const uint32_t nbifDoorbell = sdmaDoorbell ? rd(IpDiscovery::HwNbif, NbifS2aDoorbell2) : 0;
+	if (rb == kBad || ib == kBad || db == kBad || watchdog == kBad ||
+	    utcl1Cntl == kBad || utcl1Page == kBad || mcu == kBad ||
+	    (sdmaDoorbell && (doorbellOffset == kBad || nbifDoorbell == kBad))) {
+		CLOG("sdma: queue register preflight failed (RB 0x%08x IB 0x%08x DB 0x%08x watchdog 0x%08x UTCL1 0x%08x/0x%08x MCU 0x%08x doorbell-offset 0x%08x NBIF 0x%08x); refusing queue programming",
+		     rb, ib, db, watchdog, utcl1Cntl, utcl1Page, mcu, doorbellOffset, nbifDoorbell);
+		return false;
+	}
 	rb = (rb & ~(kSdmaRbSizeMask | kSdmaRbEnable)) | (sizeLog2 << kSdmaRbSizeShift) | kSdmaRbPriv;
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb);
 	// Fresh engine: 0 (sdma_v7_0_gfx_resume_instance). After a wake WITHOUT power loss: the engine's own 64-bit pointers (sdmaStartPtr, P7).
@@ -2611,29 +2665,65 @@ bool RDNA4Compute::sdmaQueueInit() {
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbWptrHi), static_cast<uint32_t>(sdmaStartPtr >> 32));
 	// sdma_v7_0 always uses a doorbell (use_doorbell = true): SDMA0 on
 	// dword kSdmaDoorbellDword, routed by NBIF S2A entry 2.
-	const uint32_t db = rdGc(sdma(0, SdmaQ0Doorbell));
 	if (sdmaDoorbell) {
 		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell), db | kSdmaDoorbellEnable);
 		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0DoorbellOffset),
-		   (rdGc(sdma(0, SdmaQ0DoorbellOffset)) & ~(0x3ffffffu << 2)) | (kSdmaDoorbellDword << 2));
+		   (doorbellOffset & ~(0x3ffffffu << 2)) | (kSdmaDoorbellDword << 2));
 		wr(IpDiscovery::HwNbif, NbifS2aDoorbell2,
-		   (rd(IpDiscovery::HwNbif, NbifS2aDoorbell2) & ~kS2aDoorbell2Mask) | kS2aDoorbell2Sdma);
+		   (nbifDoorbell & ~kS2aDoorbell2Mask) | kS2aDoorbell2Sdma);
 	} else {
 		wr(IpDiscovery::HwGc, sdma(0, SdmaQ0Doorbell), db & ~kSdmaDoorbellEnable);
 	}
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0MinorPtrUpd), 0);
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaWatchdogCntl),
-	   (rdGc(sdma(0, SdmaWatchdogCntl)) & ~kSdmaWatchdogHangMask) | 1);
+	   (watchdog & ~kSdmaWatchdogHangMask) | 1);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Cntl),
-	   (rdGc(sdma(0, SdmaUtcl1Cntl)) & ~(kSdmaUtcl1RespMask | kSdmaUtcl1RedoMask)) | (3u << 9) | 9);
+	   (utcl1Cntl & ~(kSdmaUtcl1RespMask | kSdmaUtcl1RedoMask)) | (3u << 9) | 9);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaUtcl1Page),
-	   (rdGc(sdma(0, SdmaUtcl1Page)) & kSdmaUtcl1PagePolicyKeep) | kSdmaUtcl1PagePolicy);
+	   (utcl1Page & kSdmaUtcl1PagePolicyKeep) | kSdmaUtcl1PagePolicy);
 	wr(IpDiscovery::HwGc, sdma(0, SdmaMcuCntl),
-	   rdGc(sdma(0, SdmaMcuCntl)) & ~(kSdmaMcuHalt | kSdmaMcuReset));
+	   mcu & ~(kSdmaMcuHalt | kSdmaMcuReset));
 
 	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0RbCntl), rb | kSdmaRbEnable);
-	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0IbCntl), rdGc(sdma(0, SdmaQ0IbCntl)) | kSdmaIbEnable);
+	wr(IpDiscovery::HwGc, sdma(0, SdmaQ0IbCntl), ib | kSdmaIbEnable);
+
+	// Read back the state that makes the queue capable of accepting work.
+	// A posted write or inaccessible register is not a successful init.
+	const uint32_t status = rdGc(sdma(0, SdmaStatusReg));
+	const uint32_t rbCheck = rdGc(sdma(0, SdmaQ0RbCntl));
+	const uint32_t ibCheck = rdGc(sdma(0, SdmaQ0IbCntl));
+	const uint32_t baseLo = rdGc(sdma(0, SdmaQ0RbBase));
+	const uint32_t baseHi = rdGc(sdma(0, SdmaQ0RbBaseHi));
+	const uint32_t rptrLo = rdGc(sdma(0, SdmaQ0RbRptr));
+	const uint32_t rptrHi = rdGc(sdma(0, SdmaQ0RbRptrHi));
+	const uint32_t wptrLo = rdGc(sdma(0, SdmaQ0RbWptr));
+	const uint32_t wptrHi = rdGc(sdma(0, SdmaQ0RbWptrHi));
+	const uint32_t pollLo = rdGc(sdma(0, SdmaQ0WptrPollLo));
+	const uint32_t pollHi = rdGc(sdma(0, SdmaQ0WptrPollHi));
+	const uint32_t rptrAddrLo = rdGc(sdma(0, SdmaQ0RptrAddrLo));
+	const uint32_t rptrAddrHi = rdGc(sdma(0, SdmaQ0RptrAddrHi));
+	const uint32_t expectedBaseLo = static_cast<uint32_t>(ring >> 8);
+	const uint32_t expectedBaseHi = static_cast<uint32_t>(ring >> 40);
+	const uint32_t expectedPollLo = static_cast<uint32_t>(wpoll);
+	const uint32_t expectedPollHi = static_cast<uint32_t>(wpoll >> 32);
+	const uint32_t expectedRptrLo = static_cast<uint32_t>(rwb) & ~3u;
+	const uint32_t expectedRptrHi = static_cast<uint32_t>(rwb >> 32);
+	if (status == kBad || !(status & kSdmaUcodeInitDone) ||
+	    rbCheck == kBad || !(rbCheck & kSdmaRbEnable) ||
+	    ibCheck == kBad || !(ibCheck & kSdmaIbEnable) ||
+	    baseLo != expectedBaseLo || baseHi != expectedBaseHi ||
+	    rptrLo != static_cast<uint32_t>(sdmaStartPtr) ||
+	    rptrHi != static_cast<uint32_t>(sdmaStartPtr >> 32) ||
+	    wptrLo != static_cast<uint32_t>(sdmaStartPtr) ||
+	    wptrHi != static_cast<uint32_t>(sdmaStartPtr >> 32) ||
+	    pollLo != expectedPollLo || pollHi != expectedPollHi ||
+	    rptrAddrLo != expectedRptrLo || rptrAddrHi != expectedRptrHi) {
+		CLOG("sdma: queue readback failed: status 0x%08x RB 0x%08x IB 0x%08x base 0x%08x:%08x rptr 0x%08x:%08x wptr 0x%08x:%08x poll 0x%08x:%08x rptrAddr 0x%08x:%08x",
+		     status, rbCheck, ibCheck, baseHi, baseLo, rptrHi, rptrLo,
+		     wptrHi, wptrLo, pollHi, pollLo, rptrAddrHi, rptrAddrLo);
+		return false;
+	}
 	return true;
 }
 
@@ -2672,6 +2762,15 @@ bool RDNA4Compute::stageSdma() {
 		     rdGc(sdma(0, SdmaMcuCntl)), *poolDw(kSdmaRptrOffset));
 		logGcFault("sdma");
 	};
+	// stageSdma submits directly to the ring before the runtime's fenced
+	// submission helper is available. If its completion probe times out,
+	// preserve the ring and old runtime state just like a later SDMA fence
+	// timeout; a missing write is not proof that the engine is idle.
+	auto quarantine = [this](const char *why) {
+		sdmaQuarantined = true;
+		resumeQuarantined = true;
+		CLOG("sdma: stage test could not prove queue quiescence (%s); retaining runtime backing", why);
+	};
 
 	// 1. GC hub, after the microengines' start addresses (amdgpu's order).
 	trail("s4: CP RS64 config");
@@ -2695,12 +2794,29 @@ bool RDNA4Compute::stageSdma() {
 	if (resumePending) {
 		const uint32_t rl = rdGc(sdma(0, SdmaQ0RbRptr)), rh = rdGc(sdma(0, SdmaQ0RbRptrHi));
 		const uint32_t wl = rdGc(sdma(0, SdmaQ0RbWptr)), wh = rdGc(sdma(0, SdmaQ0RbWptrHi));
-		if (rl != kBad && rh != kBad && wl != kBad && wh != kBad) {
-			const uint64_t rp = (static_cast<uint64_t>(rh) << 32) | rl, wp = (static_cast<uint64_t>(wh) << 32) | wl;
-			startPtr = (rp > wp ? rp : wp) & ~3ull;
-			CLOG("sdma: resume without a power loss? engine pointers rptr 0x%llx wptr 0x%llx: the ring resumes at 0x%llx (0 = the engine was reset)",
-			     static_cast<unsigned long long>(rp), static_cast<unsigned long long>(wp), static_cast<unsigned long long>(startPtr));
+		if (rl == kBad || rh == kBad || wl == kBad || wh == kBad) {
+			sdmaQuarantined = resumeQuarantined = true;
+			CLOG("sdma: resume pointer read failed (rptr 0x%08x:0x%08x, wptr 0x%08x:0x%08x); refusing to clear or reuse the ring",
+			     rh, rl, wh, wl);
+			publish();
+			return false;
 		}
+		const uint64_t rp = (static_cast<uint64_t>(rh) << 32) | rl;
+		const uint64_t wp = (static_cast<uint64_t>(wh) << 32) | wl;
+		// The ring is disabled during sleep. A safe restart requires proof that
+		// every submitted byte was consumed before the ring backing is cleared.
+		// Do not round pointers down or take their maximum: either can conceal
+		// a stale, corrupt, or partially consumed queue.
+		if ((rp & 3) || (wp & 3) || rp != wp) {
+			sdmaQuarantined = resumeQuarantined = true;
+			CLOG("sdma: resume pointers are not a drained, aligned pair (rptr 0x%llx wptr 0x%llx); retaining the old ring",
+			     static_cast<unsigned long long>(rp), static_cast<unsigned long long>(wp));
+			publish();
+			return false;
+		}
+		startPtr = rp;
+		CLOG("sdma: resume pointer pair verified drained at 0x%llx",
+		     static_cast<unsigned long long>(startPtr));
 	}
 	sdmaStartPtr = startPtr;
 	Sdma::Ring &ring = sdmaRing;              // kept: the runtime's DMA uses it
@@ -2715,17 +2831,35 @@ bool RDNA4Compute::stageSdma() {
 	*poolDw(kSdmaWptrOffset + 4) = static_cast<uint32_t>(startPtr >> 32);
 	flushHdp();
 	trail("s4: SDMA MCU unhalt");
-	sdmaStartMcus();
+	if (!sdmaStartMcus()) {
+		// At least one MCU may already have been unhalted. A failed status
+		// check does not prove that firmware left its queue context untouched.
+		// Retain the ring and DMA backing until a later proven reset.
+		quarantine("SDMA MCU firmware bring-up failure");
+		publish();
+		return false;
+	}
 	sdmaDoorbell = doorbellMapBar();
-	sdmaQueueInit();
+	if (!sdmaQueueInit()) {
+		// Queue programming has begun and the engine may have observed some
+		// of it. Keep the ring backing until a later proven reset.
+		quarantine("SDMA queue initialisation/readback failure");
+		publish();
+		return false;
+	}
 	status();
 
 	// 3. First packet: one dword written by the engine (amdgpu's ring test),
 	//    kicked through the doorbell as amdgpu does; if it does not land,
 	//    the doorbell goes off and the RB_WPTR registers are tried.
 	trail("s4: SDMA WRITE_LINEAR test");
-	uint32_t pkt[8];
-	ring.emit(pkt, Sdma::writeDword(pkt, poolMc(kSdmaTestOffset), 0xDEADBEEF));
+	uint32_t pkt[Sdma::kWriteDwords];
+	if (Sdma::writeDword(pkt, poolMc(kSdmaTestOffset), 0xDEADBEEF) != Sdma::kWriteDwords ||
+	    !ring.emit(pkt, Sdma::kWriteDwords)) {
+		CLOG("sdma: could not encode or enqueue the initial WRITE_LINEAR probe");
+		publish();
+		return false;
+	}
 	auto landed = [this]() {
 		for (uint32_t ms = 0; ms < 200; ms++) {
 			if (*poolDw(kSdmaTestOffset) == 0xDEADBEEF)
@@ -2752,6 +2886,7 @@ bool RDNA4Compute::stageSdma() {
 	if (!wrote) {
 		CLOG("sdma: WRITE_LINEAR did not land (test dword 0x%08x)", *poolDw(kSdmaTestOffset));
 		status();
+		quarantine("WRITE_LINEAR completion timeout");
 		publish();
 		return false;
 	}
@@ -2766,8 +2901,18 @@ bool RDNA4Compute::stageSdma() {
 	*poolDw(kFillOffset + kFillBytes - 4) = 0;
 	flushHdp();
 	uint64_t t0 = mach_absolute_time();
-	ring.emit(pkt, Sdma::constFill(pkt, poolMc(kFillOffset), pattern, kFillBytes));
-	ring.emit(pkt, Sdma::fence(pkt, poolMc(kSdmaFenceOffset), sdmaFence = 1));
+	uint32_t fill[Sdma::kFillDwords], fence[Sdma::kFenceDwords];
+	const uint32_t fillDwords = Sdma::constFill(fill, poolMc(kFillOffset), pattern, kFillBytes);
+	const uint32_t fenceDwords = Sdma::fence(fence, poolMc(kSdmaFenceOffset), sdmaFence = 1);
+	const uint64_t sequenceDwords = static_cast<uint64_t>(fillDwords) + fenceDwords;
+	if (fillDwords != Sdma::kFillDwords || fenceDwords != Sdma::kFenceDwords ||
+	    sequenceDwords >= ring.sizeBytes() / 4 ||
+	    ring.wptr() > UINT64_MAX - sequenceDwords * 4 ||
+	    !ring.emit(fill, fillDwords) || !ring.emit(fence, fenceDwords)) {
+		CLOG("sdma: could not encode or enqueue the CONST_FILL/FENCE probe; ring was not kicked");
+		publish();
+		return false;
+	}
 	sdmaKick(ring.wptr());
 	bool fenced = false;
 	for (uint32_t us = 0; us < 500000 && !fenced; us += 10) {
@@ -2781,6 +2926,7 @@ bool RDNA4Compute::stageSdma() {
 	if (!fenced) {
 		CLOG("sdma: fill fence never came (0x%08x)", *poolDw(kSdmaFenceOffset));
 		status();
+		quarantine("CONST_FILL fence timeout");
 		publish();
 		return false;
 	}

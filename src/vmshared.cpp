@@ -40,6 +40,10 @@ bool RDNA4Compute::poolFenceReached(void *context, uint32_t domain, uint32_t seq
 // The two shared queues' homes: one per MEC pipe, queue 2 (queue 0 of pipe 0 is the boot queue, (0,1) is the boot self-test's slot). They use the
 // pool areas past the client slots (kVmQueueBase + 8 and 9 strides), so no client slot is touched.
 bool RDNA4Compute::sharedStart(uint32_t k) {
+	// A previous stop timed out. Never zero/reinitialize the ring or its
+	// fence memory while the old HQD may still be fetching from it.
+	if (resumeQuarantined)
+		return false;
 	SharedQueue &s = sharedQ[k];
 	s.pipe = k;
 	s.queue = 2;
@@ -73,6 +77,10 @@ bool RDNA4Compute::sharedStart(uint32_t k) {
 // Called under rtLock when the first shared client opens (and again after a resume): SH_MEM_CONFIG/BASES for every VMID, once, like
 // gfx_v12_0_constants_init, then both queues.
 bool RDNA4Compute::vmSharedEnsure() {
+	// A failed queue stop is not recoverable by simply starting it again:
+	// its old ring backing may still be GPU-reachable.
+	if (resumeQuarantined)
+		return false;
 	if (sharedInit)
 		return true;
 	rdna4Step("vmSharedEnsure: GC awake (gcEnsureAwake)");
@@ -116,11 +124,16 @@ void RDNA4Compute::sharedStopAll(const char *why) {
 				IODelay(10);
 		}
 		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!idle)
-			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x)", k, why, rdGc(CpHqdActive));
+		if (!idle) {
+			SLOG("shared queue %u (%s): dequeue timeout (ACTIVE 0x%08x); queue remains quarantined", k, why, rdGc(CpHqdActive));
+			s.wedged = true;
+			resumeQuarantined = true;
+		}
 		grbmSelect(0, 0, 0, 0);
-		s.up = false;
-		queueUsed[s.pipe][s.queue] = false;
+		// Keep software ownership consistent with hardware. In particular,
+		// do not advertise this HQD as free after a dequeue timeout.
+		s.up = !idle;
+		queueUsed[s.pipe][s.queue] = !idle;
 	}
 	sharedInit = false;
 }
@@ -270,21 +283,37 @@ uint32_t RDNA4Compute::vmAcquire(RtClient &c) {
 		}
 		c.vmid = g.vmid;
 		if (!vmContextInit(c)) {
-			SLOG("VMID %u: context programming for client slot %d failed", g.vmid, static_cast<int>(&c - clients));
-			uint32_t dropped = 0;
-			vmPool.forget(reinterpret_cast<uintptr_t>(&c), true, dropped);
+			SLOG("VMID %u: context programming for client slot %d failed; quarantining it", g.vmid, static_cast<int>(&c - clients));
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			(void)vmInvalidate(g.vmid, "vmpool context-init failure");
+			vmPool.quarantine(g.vmid);
+			c.vmid = 0;
 			return 0;
 		}
 		wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, c.pasid);      // IH_VMID_n_LUT = PASID: a fault vector from this VMID names the client
-		(void)vmInvalidate(g.vmid, "vmpool rebind");
+		if (!vmInvalidate(g.vmid, "vmpool rebind")) {
+			SLOG("VMID %u: rebind invalidate timed out; context disabled and VMID quarantined", g.vmid);
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			vmPool.quarantine(g.vmid);
+			c.vmid = 0;
+			return 0;
+		}
 		if (g.stolen)
 			SLOG("VMID %u: rebound from client slot %d to slot %d (PASID %u)", g.vmid,
 			     reinterpret_cast<const RtClient *>(g.prevOwner) >= clients ? static_cast<int>(reinterpret_cast<const RtClient *>(g.prevOwner) - clients) : -1,
 			     static_cast<int>(&c - clients), c.pasid);
 	} else {
 		c.vmid = g.vmid;
-		if (g.flush)
-			(void)vmInvalidate(g.vmid, "vmpool flush");
+		if (g.flush && !vmInvalidate(g.vmid, "vmpool flush")) {
+			SLOG("VMID %u: reuse invalidate timed out; context disabled and VMID quarantined", g.vmid);
+			wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + g.vmid - 1 }, 0);
+			wr(IpDiscovery::HwOsssys, Reg { 0, g.vmid }, 0);
+			vmPool.quarantine(g.vmid);
+			c.vmid = 0;
+			return 0;
+		}
 	}
 	return g.vmid;
 }
@@ -297,7 +326,10 @@ void RDNA4Compute::vmReleaseVmids(RtClient &c) {
 			continue;
 		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + v - 1 }, 0);
 		wr(IpDiscovery::HwOsssys, Reg { 0, v }, 0);
-		(void)vmInvalidate(v, "vmpool release");
+		if (!vmInvalidate(v, "vmpool release")) {
+			SLOG("VMID %u: release invalidate timed out; quarantined until GPU reset", v);
+			vmPool.quarantine(v);
+		}
 	}
 	uint32_t first = 0;
 	vmPool.forget(owner, true, first);

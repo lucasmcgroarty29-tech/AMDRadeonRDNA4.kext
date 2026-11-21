@@ -316,9 +316,17 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         gcSnapValid = false;
         rdna4Step("quiesce: lifting GFXOFF (gcWake)");
         gcWake(0xfffffffeu);
+	if (gcState == kGcHold) {
+		// No GC register access is safe after a failed wake. Keep every GPU-
+		// reachable allocation and the AGP aperture intact; the PCI bus-master
+		// gate is the only remaining host-DMA containment mechanism.
+		resumeQuarantined = true;
+		stopPresentationTimer();
+		env.pci->setBusMasterEnable(false);
+		RLOG("quiesce: GC wake failed; skipping all GC teardown and retaining DMA/runtime allocations");
+		return;
+	}
         rdna4Step("quiesce: interrupts off");
-        if (gcState == kGcHold)
-                CLOG("quiesce: GFXOFF could not be lifted; the GC quiesce steps are dropped and engines may keep running");
         if (ihActive)
                 ihStop();
         const uint32_t ih = rd(IpDiscovery::HwOsssys, kQuiesceIhRbCntl);
@@ -346,15 +354,19 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         auto drain = [this](uint32_t pipe, uint32_t queue, uint32_t vmid) {
                 grbmSelect(1, pipe, queue, vmid);
                 if (!(rdGc(CpHqdActive) & 1))
-                        return;
+                        return true;
                 CLOG("quiesce: dequeue HQD ME1 pipe%u queue%u VMID%u", pipe, queue, vmid);
                 wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
                 for (uint32_t us = 0; us < 100000 && (rdGc(CpHqdActive) & 1); us += 10)
                         IODelay(10);
-                if (rdGc(CpHqdActive) & 1)
-                        CLOG("quiesce: HQD pipe%u queue%u VMID%u drain timed out; continuing",
+                const bool inactive = !(rdGc(CpHqdActive) & 1);
+                if (!inactive) {
+                        resumeQuarantined = true;
+                        CLOG("quiesce: HQD pipe%u queue%u VMID%u drain timed out; retaining runtime and DMA allocations",
                              pipe, queue, vmid);
+                }
                 wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+                return inactive;
         };
         if (rtLock) {
                 IOLockLock(rtLock);
@@ -362,14 +374,26 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
         rdna4Step("quiesce: draining HQDs");
         drain(0, 0, 0);
         for (const RtClient &client : clients)
-                if (client.active)
+                if (client.active && !client.shared)
                         drain(client.pipe, client.queue, client.vmid);
+        // Shared-mode clients do not own their HQDs. Their work runs on the
+        // two kernel-owned VMID-0 queues, so drain those explicitly as well
+        // before halting MEC or considering the DMA backing releasable.
+        if (vmShared && sharedInit) {
+                sharedStopAll("system shutdown");
+                for (const SharedQueue &queue : sharedQ)
+                        if (queue.wedged) {
+                                resumeQuarantined = true;
+                                RLOG("quiesce: shared compute queue failed to stop; retaining runtime and DMA allocations");
+                        }
+        }
         grbmSelect(0, 0, 0, 0);
         wr(IpDiscovery::HwGc, CpMecRs64Cntl,
            rd(IpDiscovery::HwGc, CpMecRs64Cntl) | kRs64Halt);
         wr(IpDiscovery::HwGc, CpMeCntl,
            rd(IpDiscovery::HwGc, CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 
+        bool sdmaIdle = true;
         for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++) {
                 const auto rb = sdma(instance, SdmaQ0RbCntl);
                 const auto mcu = sdma(instance, SdmaMcuCntl);
@@ -377,9 +401,33 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
                    ~(kSdmaRbEnable | kSdmaRbRptrWriteback));
                 wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
                 wr(IpDiscovery::HwGc, mcu, rd(IpDiscovery::HwGc, mcu) | kSdmaMcuHalt);
+                // SDMA_STATUS_REG.IDLE is the engine's own idle indication
+                // (also used by amdgpu's sdma_v7_0_is_idle/wait_for_idle).
+                // Do not free the pinned bounce buffer on a halt write alone.
+                bool idle = false;
+                uint32_t status = 0xffffffffu;
+                for (uint32_t us = 0; us < 100000; us++) {
+                        status = rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg));
+                        // An inaccessible MMIO read returns 0xffffffffu (all ones).
+                        // Never mistake that sentinel for an asserted IDLE bit.
+                        if (status != 0xffffffffu && (status & kSdmaIdle)) {
+                                idle = true;
+                                break;
+                        }
+                        IODelay(1);
+                }
+                if (!idle) {
+                        sdmaIdle = false;
+                        resumeQuarantined = true;
+                        RLOG("quiesce: SDMA%u did not acknowledge IDLE after halt (status 0x%08x); retaining DMA backing", instance, status);
+                }
         }
-        wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
-           rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
+        if (sdmaIdle) {
+                wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
+                   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
+        } else {
+                RLOG("quiesce: global SDMA disable skipped because an instance did not become idle");
+        }
         if (rtLock)
                 IOLockUnlock(rtLock);
 
@@ -395,6 +443,11 @@ void RDNA4Compute::quiesceForShutdown(const char *why) {
 }
 
 void RDNA4Compute::publishRuntime(uint32_t stage) {
+	if (resumeQuarantined) {
+		RLOG("not published: sleep-time GPU queue did not quiesce; old runtime allocations remain quarantined until reboot");
+		publishResult("runtime", "FAIL wake queue not quiesced; allocations retained");
+		return;
+	}
 	if (!initRuntimeHeap()) {
 		RLOG("not published: %s", !rtLock ? "no lock" : "no room for a heap in the pool");
 		publishResult("runtime", "FAIL runtime heap");
@@ -639,6 +692,7 @@ bool RDNA4Compute::sparseOpen(RtClient &c, uint32_t quotaPages) {
 void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 	if (!c.sp)
 		return;
+	bool vramCleared = !clearVram;
 	if (clearVram) {
 		for (uint32_t id = 0; id < c.sp->s.idCount(); id++) {
 			uint64_t *shadow = nullptr, heapOffset = 0;
@@ -647,9 +701,15 @@ void RDNA4Compute::sparseTeardown(RtClient &c, bool clearVram) {
 			bzero(shadow, 0x1000);
 			c.sp->s.markDirty(id);
 		}
-		(void)sparseSync(c);
+		vramCleared = sparseSync(c);
+		if (!vramCleared)
+			RLOG("vmid %u: sparse page-table clear failed; retaining VRAM chunks to prevent stale tables being reused", c.vmid);
 	}
-	c.sp->s.releaseAll(sparseHost(), clearVram);
+	/* Never return a chunk to the heap unless its old page-table contents
+	 * were cleared successfully. On failure we intentionally leak the VRAM
+	 * allocation until the next GPU reset rather than let another client
+	 * inherit stale PDEs/PTEs. Host shadow pages can still be released. */
+	c.sp->s.releaseAll(sparseHost(), vramCleared);
 	IOFree(c.sp, sizeof(SparseTables));
 	c.sp = nullptr;
 	c.rootMc = c.rootPhys = 0;
@@ -670,44 +730,62 @@ bool RDNA4Compute::vmMap(RtClient &c, uint64_t va, uint64_t mc, uint64_t bytes, 
 	    (mc & (GpuVm::kPageBytes - 1)))
 		return false;
 	uint64_t physical = 0;
-	if (!gpuPhysical(mc, physical))
+	if (!gpuPhysical(mc, physical) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
 		return false;
-	if (bytes > ~0ull - (GpuVm::kPageBytes - 1))
-		return false;   // the round-up would wrap (to a small size that passes the checks below)
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
 	if (end < va || end > GpuVm::kVaEnd)
 		return false;
+
 	if (c.sp) {
-		/* Sparse tables: GpuVmTable::treeMapVram creates the directories and PT pages the range needs; the pages it changed are synced. */
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		if (!GpuVmTable::treeMapVram(tree, vmPolicy(), va, end, physical, executable)) {
-			/* treeMapVram clears any prefix it installed in the shadow. Sync
-			 * that rollback too, or VRAM may retain a partial mapping. */
-			if (!sparseSync(c))
-				RLOG("vmid %u: failed to sync sparse VRAM-map rollback", c.vmid);
+			/* treeMapVram clears any prefix it installed in the shadow. That rollback
+			 * must reach VRAM too, or a partial mapping can outlive this failed call. */
+			if (!sparseSync(c)) {
+				c.mapQuarantined = c.aborted = true;
+				RLOG("vmid %u: sparse VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
+			}
 			return false;
 		}
-		return sparseSync(c);
+		if (sparseSync(c))
+			return true;
+		GpuVmTable::treeUnmap(tree, va, end);
+		if (!sparseSync(c)) {
+			c.mapQuarantined = c.aborted = true;
+			RLOG("vmid %u: sparse VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
+		}
+		return false;
 	}
-	/* The entries are written by GpuVmTable::mapVram (src/gpuvmtable.cpp): the pre-S8 loop, byte-compared against the old code by the host test. */
+
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapVram(access, vmPolicy(), kVmTableBytes, va, end, physical, executable, span))
 		return false;
-	/* The root, PDB1, and the PDB0 entry that points at the PT all have to
-	 * reach VRAM before the queue can walk this mapping. */
-	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
-	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
-	if (c.tableCpu)
-		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
-	return span.firstPt != ~0ull &&
-	       (!span.directories || (vmTableSync(c, 0, 0x3000) &&
-	                              vmTableSync(c, GpuVmTable::kDenseUpperPdb0, GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
-	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
-}
+	auto syncRange = [&](const GpuVmTable::Span &changed, bool directories) {
+		if (c.tableCpu)
+			return vmSyncCpu(c, va, end);
+		return (!directories || (vmTableSync(c, 0, 0x3000) &&
+		                         vmTableSync(c, GpuVmTable::kDenseUpperPdb0,
+		                                     GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
+		       changed.firstPt != ~0ull &&
+		       vmTableSync(c, static_cast<uint32_t>(changed.firstPt),
+		                   static_cast<uint32_t>(changed.lastPt - changed.firstPt + 0x1000));
+	};
+	if (syncRange(span, span.directories))
+		return true;
 
+	/* The shadow was changed even though the VRAM sync failed. Remove those PTEs
+	 * and sync the rollback before the caller is allowed to release its backing. */
+	GpuVmTable::Span rollback;
+	GpuVmTable::unmap(access, kVmTableBytes, va, end, rollback);
+	if (!syncRange(rollback, span.directories)) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: dense VRAM-map rollback sync failed; client allocations quarantined", c.vmid);
+	}
+	return false;
+}
 bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses,
                              uint64_t bytes, bool executable, bool readOnly) {
 	if (!poolCpu || !hasTables(c) || !pageBuses || !bytes ||
@@ -721,29 +799,47 @@ bool RDNA4Compute::vmMapHost(RtClient &c, uint64_t va, const uint64_t *pageBuses
 		TreeCtx tc { this, &c };
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		if (!GpuVmTable::treeMapHost(tree, vmPolicy(), va, end, pageBuses, executable, readOnly)) {
-			/* Flush the rollback as well as the successful path: a prefix PTE
-			 * may already have reached VRAM before a later allocation failed. */
-			if (!sparseSync(c))
-				RLOG("vmid %u: failed to sync sparse host-map rollback", c.vmid);
+			if (!sparseSync(c)) {
+				c.mapQuarantined = c.aborted = true;
+				RLOG("vmid %u: sparse host-map rollback sync failed; client allocations quarantined", c.vmid);
+			}
 			return false;
 		}
-		return sparseSync(c);
+		if (sparseSync(c))
+			return true;
+		GpuVmTable::treeUnmap(tree, va, end);
+		if (!sparseSync(c)) {
+			c.mapQuarantined = c.aborted = true;
+			RLOG("vmid %u: sparse host-map rollback sync failed; client allocations quarantined", c.vmid);
+		}
+		return false;
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	if (!GpuVmTable::mapHost(access, vmPolicy(), kVmTableBytes, va, end, pageBuses, executable, span, readOnly))
 		return false;
-	/* The root and directory pages when a PDE was written (the first mapping in a 2 MiB range: once written, a PDE stays), then the leaf
-	 * pages the span touched in one copy: each sync is an SDMA job, and its round trip, not its size, is what a mapping costs. */
-	if (c.tableCpu)
-		return span.firstPt != ~0ull && vmSyncCpu(c, va, end);
-	return span.firstPt != ~0ull &&
-	       (!span.directories || (vmTableSync(c, 0, 0x3000) &&
-	                              vmTableSync(c, GpuVmTable::kDenseUpperPdb0, GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
-	       vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000));
-}
+	auto syncRange = [&](const GpuVmTable::Span &changed, bool directories) {
+		if (c.tableCpu)
+			return vmSyncCpu(c, va, end);
+		return (!directories || (vmTableSync(c, 0, 0x3000) &&
+		                         vmTableSync(c, GpuVmTable::kDenseUpperPdb0,
+		                                     GpuVmTable::kDenseUpperPt - GpuVmTable::kDenseUpperPdb0))) &&
+		       changed.firstPt != ~0ull &&
+		       vmTableSync(c, static_cast<uint32_t>(changed.firstPt),
+		                   static_cast<uint32_t>(changed.lastPt - changed.firstPt + 0x1000));
+	};
+	if (syncRange(span, span.directories))
+		return true;
 
+	GpuVmTable::Span rollback;
+	GpuVmTable::unmap(access, kVmTableBytes, va, end, rollback);
+	if (!syncRange(rollback, span.directories)) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: dense host-map rollback sync failed; client allocations quarantined", c.vmid);
+	}
+	return false;
+}
 bool RDNA4Compute::initRuntimeHeap() {
 	if (!rtLock || !poolCpu || pool.size <= kHeapOffset)
 		return false;
@@ -763,29 +859,45 @@ bool RDNA4Compute::initRuntimeHeap() {
 	return heap.size() != 0;
 }
 
-void RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
-	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) || bytes > ~0ull - (GpuVm::kPageBytes - 1))
-		return;   // (the last: the round-up would wrap)
+bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
+	if (!poolCpu || !hasTables(c) || !bytes || va & (GpuVm::kPageBytes - 1) ||
+	    bytes > ~0ull - (GpuVm::kPageBytes - 1))
+		return false;   // (the last: the round-up would wrap)
 	c.tlbSeq++;      /* a removed PTE: the next job on any VMID this client owns flushes first (amdgpu's tlb_seq) */
 	const uint64_t end = va + ((bytes + GpuVm::kPageBytes - 1) & ~(GpuVm::kPageBytes - 1));
+	if (end < va || va < GpuVm::kVaStart || end > GpuVm::kVaEnd)
+		return false;
 	if (c.sp) {
 		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		GpuVmTable::treeUnmap(tree, va, end);
-		if (!sparseSync(c))
-			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
-		return;
+		const bool synced = sparseSync(c);
+		if (!synced) {
+			c.mapQuarantined = c.aborted = true;
+			RLOG("vmid %u: sparse page-table unmap sync failed; client quarantined", c.vmid);
+		}
+		return synced;
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
 	GpuVmTable::Span span;
 	GpuVmTable::unmap(access, kVmTableBytes, va, end, span);
-	if (span.firstPt != ~0ull && c.tableCpu)
-		(void)vmSyncCpu(c, va, end);
-	else if (span.firstPt != ~0ull && !vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000)))
-		RLOG("vmid %u: page-table unmap sync failed", c.vmid);   // one SDMA job for the span, as vmMapHost
+	if (span.firstPt == ~0ull)
+		return true;
+	if (c.tableCpu) {
+		if (vmSyncCpu(c, va, end))
+			return true;
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: CPU-table unmap sync failed; client quarantined", c.vmid);
+		return false;
+	}
+	if (!vmTableSync(c, static_cast<uint32_t>(span.firstPt), static_cast<uint32_t>(span.lastPt - span.firstPt + 0x1000))) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("vmid %u: dense page-table unmap sync failed; client quarantined", c.vmid);
+		return false;
+	}
+	return true;
 }
-
 /* Tables in the pool (rtPreferCpuTables): only the entries of [va, end) copied through the BAR, its PDB0 entries and its PTEs (the dense
  * layout keeps both in VA order within a GiB), then HDP flushed. Whole pages were 16 KiB of uncached BAR writes for a mapping of a few dozen pages. */
 bool RDNA4Compute::vmSyncCpu(RtClient &c, uint64_t va, uint64_t end) {
@@ -886,12 +998,18 @@ bool RDNA4Compute::vmContextInit(RtClient &c) {
 /* Invalidate the VMID(s) the client's translations can be cached in: its fixed VMID, or (rdna4-vmshared=2) each VMID the pool has bound to it. A client with
  * none bound has nothing cached; its removed PTEs are caught by tlbSeq at its next grab (amdgpu's tlb_seq). */
 bool RDNA4Compute::vmInvalidateOwned(RtClient &c, const char *tag) {
-	if (vmShared != 2)
-		return vmInvalidate(c.vmid, tag);
 	bool ok = true;
-	for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++)
-		if (vmPool.ownerOf(v) == reinterpret_cast<uintptr_t>(&c))
-			ok &= vmInvalidate(v, tag);
+	if (vmShared != 2) {
+		ok = vmInvalidate(c.vmid, tag);
+	} else {
+		for (uint32_t v = Vmid::kFirst; v <= Vmid::kLast; v++)
+			if (vmPool.ownerOf(v) == reinterpret_cast<uintptr_t>(&c))
+				ok &= vmInvalidate(v, tag);
+	}
+	if (!ok) {
+		c.mapQuarantined = c.aborted = true;
+		RLOG("client VMID translations quarantined after invalidation failure (%s)", tag);
+	}
 	return ok;
 }
 
@@ -1895,14 +2013,25 @@ IOReturn RDNA4Compute::rtOpenInner(const void *owner) {
 	    !vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !c->pm4.init(poolDw(qoff + kVmPq), qva, kPqSize) || !vmContextInit(*c)) {
+		if (c->mapQuarantined) {
+			c->active = true;
+			c->aborted = true;
+			RLOG("vmid %u: failed client open retained after unsafe page-table rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
 	c->doorbell = (0x0d + slot) * 2;
-	/* A VMID taken by a new owner is flushed before first use (amdgpu_vmid_grab
-	 * sets needs_flush, amdgpu_vm_flush emits it): no stale translations from
-	 * an earlier client or an earlier boot. A timeout is logged, not fatal. */
-	(void)vmInvalidate(vmid, "client context enable");
+	/* A new owner must not run until stale translations are gone. If the invalidate
+	 * times out, retire this VMID until reset instead of submitting into an unknown context. */
+	if (!vmInvalidate(vmid, "client context enable")) {
+		RLOG("vmid %u: initial invalidate timed out; VMID quarantined until GPU reset", vmid);
+		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
+		vmidUsed[vmid] = true;
+		IOFree(c->tableShadow, kVmTableBytes); devHeap.free(table); *c = RtClient {};
+		return kIOReturnNotResponding;
+	}
 	vmidUsed[vmid] = true; queueUsed[pipe][queue] = true;
 	if (!hqdInitFor(false, pipe, queue, vmid, poolMc(qoff + kVmMqd), eva >> 8, qva >> 8,
 	               rva, wva, c->doorbell)) {
@@ -1967,8 +2096,8 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 		/* Zeroed by SDMA and only the root's and directories' pages written through the BAR: CPU writes to the pool make some
 		 * 12 MB/s, the whole table a stall of 650 ms in the client's first draw (the boot's progress bar stopped). */
 		uint32_t fill[Sdma::kFillDwords];
-		Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes);
-		const bool zeroed = sdmaRun(fill, Sdma::kFillDwords, 2000);
+		const bool zeroed = Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes) == Sdma::kFillDwords &&
+		                    sdmaRun(fill, Sdma::kFillDwords, 2000);
 
 		memcpy(poolWc + table, c->tableShadow, zeroed ? 0x3000 : kVmTableBytes);
 		__builtin_ia32_sfence();
@@ -1997,12 +2126,24 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(qoff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(qoff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(qoff + kVmIb), 0x1000, true) || (rdna4Step("rtOpenShared: VM context"), !vmContextInit(*c))) {
+		if (c->mapQuarantined) {
+			c->active = true;
+			c->aborted = true;
+			RLOG("vmid %u: failed shared open retained after unsafe page-table rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		IOFree(c->tableShadow, kVmTableBytes); freeTable(); *c = RtClient {};
 		return kIOReturnNoMemory;
 	}
 	c->doorbell = sharedQ[sq].doorbell;
 	rdna4Step("rtOpenShared: TLB invalidate");
-	(void)vmInvalidate(vmid, "client context enable");
+	if (!vmInvalidate(vmid, "client context enable")) {
+		RLOG("vmid %u: initial shared-context invalidate timed out; VMID quarantined until GPU reset", vmid);
+		wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + vmid - 1 }, 0);
+		vmidUsed[vmid] = true;
+		IOFree(c->tableShadow, kVmTableBytes); freeTable(); *c = RtClient {};
+		return kIOReturnNotResponding;
+	}
 	rdna4Step("rtOpenShared: TLB invalidate done");
 	vmidUsed[vmid] = true;
 	c->active = true;
@@ -2053,6 +2194,12 @@ IOReturn RDNA4Compute::rtOpenPooled(const void *owner, uint32_t slot, RtClient *
 	if (!vmMap(*c, c->fenceVa, poolMc(c->poolOff + kVmFence), 0x1000, false) ||
 	    !vmMap(*c, c->kernargVa, poolMc(c->poolOff + kVmKernarg), 0x1000, false) ||
 	    !vmMap(*c, c->ibVa, poolMc(c->poolOff + kVmIb), 0x1000, true)) {
+		if (c->mapQuarantined) {
+			c->active = true;
+			c->aborted = true;
+			RLOG("PASID %u: failed pooled open retained after unsafe page-table rollback", c->pasid);
+			return kIOReturnNotResponding;
+		}
 		sparseTeardown(*c, true);
 		*c = RtClient {};
 		return kIOReturnNoMemory;
@@ -2587,6 +2734,10 @@ IOReturn RDNA4Compute::allocLocked(const void *owner, uint64_t bytes, uint64_t &
 	if (c) {
 		b.va = vaTake(*c, bytes);
 		if (!b.va || !vmMap(*c, b.va, b.mc, bytes, true)) {   /* IBs live in user buffers: R|W|X like Mesa (ac_linux_drm.c:235) */
+			if (c->mapQuarantined) {
+				RLOG("vmid %u: allocation retained after unsafe map rollback", c->vmid);
+				return kIOReturnNotResponding;
+			}
 			if (b.va)
 				vaGive(*c, b.va, bytes);
 			h.free(b.offset); b.owner = nullptr;
@@ -2743,20 +2894,40 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
                 (flags & RDNA4_HOST_EXECUTABLE) != 0, (flags & RDNA4_HOST_READ_ONLY) != 0)) {
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
-		if (b.va) {
-			vmUnmap(*c, b.va, rounded);
-			vaGive(*c, b.va, rounded);
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: host buffer retained after unsafe page-table rollback", c->vmid);
+			leakHost(b);
+			b.host = true;   // retain its slot as host-backed so reset never frees heap offset zero
+			return kIOReturnNotResponding;
 		}
-		releaseHost(b);
+		if (b.va) {
+			const bool unmapped = vmUnmap(*c, b.va, rounded);
+			const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed host-map cleanup");
+			if (invalidated) {
+				vaGive(*c, b.va, rounded);
+				releaseHost(b);
+			} else {
+				RLOG("vmid %u: failed host-map cleanup; host pages and VA retained", c->vmid);
+				leakHost(b);
+			}
+		} else {
+			releaseHost(b);
+		}
 		b.owner = nullptr;
 		return kIOReturnNoMemory;
 	}
 	if (pageBuses)
 		IOFree(pageBuses, pageCount * sizeof(uint64_t));
 	if (!vmInvalidateOwned(*c, "host map")) {
-		vmUnmap(*c, b.va, rounded);
-		vaGive(*c, b.va, rounded);
-		releaseHost(b);
+		const bool unmapped = vmUnmap(*c, b.va, rounded);
+		const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed host-map rollback");
+		if (invalidated) {
+			vaGive(*c, b.va, rounded);
+			releaseHost(b);
+		} else {
+			RLOG("vmid %u: host-map rollback failed; host pages and VA retained", c->vmid);
+			leakHost(b);
+		}
 		b.owner = nullptr;
 		return kIOReturnNotResponding;
 	}
@@ -2805,11 +2976,22 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 	b.host = true;   // unmapped like a host buffer; it has no memory of its own to release
 	b.mapped = true;
 	if (!b.va || b.va + bytes < b.va || b.va + bytes > GpuVm::kVaEnd || !vmMapHost(*c, b.va, pageBuses, bytes, false)) {
-		if (b.va) {
-			vmUnmap(*c, b.va, bytes);
-			vaGive(*c, b.va, bytes);
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: mapped-page buffer retained after unsafe page-table rollback", c->vmid);
+			return kIOReturnNotResponding;
 		}
-		b.owner = nullptr;
+		if (b.va) {
+			const bool unmapped = vmUnmap(*c, b.va, bytes);
+			const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed page-map cleanup");
+			if (invalidated) {
+				vaGive(*c, b.va, bytes);
+				b.owner = nullptr;
+			} else {
+				RLOG("vmid %u: failed page-map cleanup; mapping slot and VA retained for client close", c->vmid);
+			}
+		} else {
+			b.owner = nullptr;
+		}
 		return kIOReturnNoMemory;
 	}
 	/* No invalidation: the range held no translation since rtFree invalidated it after its last unmap (or it was never mapped), as amdgpu
@@ -2834,19 +3016,27 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	RtClient *c = vmClientFor(owner);
 	if (c && c->gfxOutstanding && owner != idleFreeOwner)
 		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
+	if (c && c->gfxQuarantined) {
+		RLOG("vmid %u: buffer free refused; a graphics IB may still be using this client's memory", c->vmid);
+		return kIOReturnNotResponding;
+	}
 	const bool host = b->host;
-	if (c && b->va)
-		vmUnmap(*c, b->va, b->bytes);
+	const bool unmapped = !b->va || (c && vmUnmap(*c, b->va, b->bytes));
 	/* Every unmap is followed by an invalidation before the memory goes back to its heap
 	 * (amdgpu sets tlb_seq on a cleared PTE and flushes before the VMID's next job,
 	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
 	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
 	 * measured on the card. When the invalidation times out the memory is never reused: the
 	 * GPU may still reach it, and host pages handed back to the kernel would take its writes. */
-	const bool forgotten = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
+	const bool invalidated = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
+	if (c && c->mapQuarantined) {
+		RLOG("vmid %u: buffer handle 0x%llx retained for reset after unmap/invalidation failure", c->vmid, handle);
+		return kIOReturnNotResponding;
+	}
+	const bool forgotten = unmapped && invalidated;
 
 	if (!forgotten)
-		RLOG("vmid %u: %s buffer unmap invalidation timed out: its memory is kept, not reused", c->vmid, host ? "host" : "device");
+		RLOG("vmid %u: %s buffer unmap sync/invalidation failed: its memory is kept, not reused", c ? c->vmid : 0, host ? "host" : "device");
 
 	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
@@ -2973,6 +3163,10 @@ IOReturn RDNA4Compute::mapMcLocked(const void *owner, uint64_t mc, uint64_t byte
 	b.gen = generation;
 	b.foreign = true;
 	if (!b.va || !vmMap(*c, b.va, b.mc, b.bytes, false)) {
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: foreign mapping retained after unsafe rollback", c->vmid);
+			return kIOReturnNotResponding;
+		}
 		if (b.va)
 			vaGive(*c, b.va, b.bytes);
 		b.owner = nullptr;
@@ -3070,6 +3264,10 @@ IOReturn RDNA4Compute::rtLoad(const void *owner, task_t task, mach_vm_address_t 
 		p.va = vaTake(*c, p.vaBytes);
 
 		if (!p.va || !vmMap(*c, p.va, poolMc(off), p.vaBytes, true)) {
+			if (c->mapQuarantined) {
+				RLOG("vmid %u: program allocation retained after unsafe map rollback", c->vmid);
+				return kIOReturnNotResponding;
+			}
 			if (p.va)
 				vaGive(*c, p.va, p.vaBytes);
 
@@ -3103,15 +3301,28 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
+	bool forgotten = !vmClientFor(owner);
 	if (RtClient *c = vmClientFor(owner)) {
-		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
-		/* As rtFree: invalidate before the code pages return to the heap. */
-		if (!vmInvalidateOwned(*c, "program unmap"))
-			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
-
-		vaGive(*c, p->va, p->vaBytes);   // after the invalidation, as rtFree
+		if (c->gfxQuarantined) {
+			RLOG("vmid %u: program unload refused; a graphics IB may still be using this client's code", c->vmid);
+			return kIOReturnNotResponding;
+		}
+		const bool unmapped = vmUnmap(*c, p->va, heap.lengthOf(p->offset));
+		/* As rtFree: both the page-table write and TLB invalidate must complete
+		 * before the VA or code allocation can be handed to another client. */
+		const bool invalidated = unmapped && vmInvalidateOwned(*c, "program unmap");
+		forgotten = unmapped && invalidated;
+		if (c->mapQuarantined) {
+			RLOG("vmid %u: program retained for reset after unmap/invalidation failure", c->vmid);
+			return kIOReturnNotResponding;
+		}
+		if (forgotten)
+			vaGive(*c, p->va, p->vaBytes);
+		else
+			RLOG("vmid %u: program unmap sync/invalidation failed; code allocation retained", c->vmid);
 	}
-	heap.free(p->offset);
+	if (forgotten)
+		heap.free(p->offset);
 	p->owner = nullptr;
 	return kIOReturnSuccess;
 }
@@ -3571,6 +3782,7 @@ void RDNA4Compute::gfxClientReset() {
 	gfxClientPending = 0;
 	for (RtClient &c : clients) {
 		c.gfxOutstanding = 0;
+		c.gfxQuarantined = false;   // a GPU reset ends the lost work; the ring and its fences are new
 		if (c.gfxFenceCpu)
 			*c.gfxFenceCpu = 0;
 		c.gfxFence = 0;
@@ -3647,8 +3859,11 @@ void RDNA4Compute::gfxClientWedge(const char *why) {
 	     "the CP fetches nothing more, and gfx submissions are refused until the next bring-up; compute queues and the display are not affected "
 	     "(a wave that is stuck in a shader may keep the GC busy: power-cycle if it does)", why);
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
-	for (RtClient &c : clients)
+	for (RtClient &c : clients) {
+		if (c.gfxOutstanding)
+			c.gfxQuarantined = true;   // the ring's lost fences no longer prove these clients' work has ended
 		c.gfxOutstanding = 0;
+	}
 	gfxClientPending = 0;
 }
 
@@ -4102,6 +4317,11 @@ void RDNA4Compute::rtRelease(const void *owner) {
 	rdna4Step("rtRelease: rtLock taken");
 	checkPresentationTimeoutLocked();
 	RtClient *early = clientFor(owner);
+	if (early && early->mapQuarantined && !powerSleeping) {
+		RLOG("vmid %u: client close deferred; unsafe page-table rollback retains its address space and allocations until GPU reset",
+		     early->vmid);
+		return;
+	}
 	if (powerSleeping || (early && early->aborted)) {
 		// Hardware is off or has already been rebuilt. The resume cleanup owns
 		// the old allocations (and dropped the pending presents); never touch
@@ -4138,45 +4358,70 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			IOSleep(1);
 		computeDone = fenceReached(*c->fenceCpu, want) || recoverSharedQueue(c->sq, c->vmid, "client close");
 	}
+	/* A private HQD must be inactive before ANY of its buffers or page tables
+	 * can be released. Previously this dequeue happened after the allocations
+	 * were returned, allowing a timed-out queue to keep writing reused memory. */
+	if (c && vmEnabled && !c->shared) {
+		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
+		grbmSelect(1, c->pipe, c->queue, c->vmid);
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
+		bool inactive = false;
+		for (uint32_t us = 0; us < 100000; us += 10) {
+			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
+			IODelay(10);
+		}
+		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
+		if (!inactive)
+			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x); client allocations quarantined",
+			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
+		grbmSelect(0, 0, 0, 0);
+		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+		computeDone = inactive;
+	}
 
 	// Work that could not be ended may still read and write the client's memory: it is left allocated (and its VMID taken) rather than
 	// handed to someone else. A wedged gfx ring halted the CP, but a wave stuck in a shader still runs.
-	if (c && ((gfxBusy && gfxWedged) || !computeDone)) {
+	if (c && (c->gfxQuarantined || (gfxBusy && gfxWedged) || !computeDone)) {
 		quarantineLocked(owner, *c);
 		return;
 	}
 
 	uint32_t nb = 0, np = 0;
-	bool hostUnmapped = false;
+	bool unmapsSynced = true;
 	for (RtBuffer &b : buffers) {
 		if (b.owner == owner) {
-			if (c)
-				vmUnmap(*c, b.va, b.bytes);
-			if (b.host) {
-				hostUnmapped = true;
-			} else {
-				(b.device ? devHeap : heap).free(b.offset);
-				b.owner = nullptr;
-			}
+			if (c && b.va)
+				unmapsSynced = vmUnmap(*c, b.va, b.bytes) && unmapsSynced;
 			nb++;
 		}
 	}
 	for (RtProgram &p : programs) {
 		if (p.owner == owner) {
-			if (c)
-				vmUnmap(*c, p.va, heap.lengthOf(p.offset));
-			heap.free(p.offset);
-			p.owner = nullptr;
+			if (c && p.va)
+				unmapsSynced = vmUnmap(*c, p.va, heap.lengthOf(p.offset)) && unmapsSynced;
 			np++;
 		}
 	}
-	const bool hostForgotten = !c || !hostUnmapped || vmInvalidateOwned(*c, "host unmap");
-
-	if (!hostForgotten)
-		RLOG("vmid %u: host buffer cleanup invalidation timed out: their pages are kept, not reused", c->vmid);
+	if (c && c->mapQuarantined) {
+		RLOG("vmid %u: client close deferred after page-table unmap failure; all allocations retained", c->vmid);
+		return;
+	}
+	/* Do not return ANY of this client's allocations until every changed page-table
+	 * range was synced and every VMID that could cache it was invalidated. This
+	 * includes device buffers and code, not just imported host pages. */
+	const bool mappingsForgotten = !c || !vmEnabled || !(nb || np) ||
+	                               (unmapsSynced && vmInvalidateOwned(*c, "client close unmap"));
+	if (c && c->mapQuarantined) {
+		RLOG("vmid %u: client close deferred after TLB invalidation failure; address space and allocations retained", c->vmid);
+		return;
+	}
+	if (!mappingsForgotten)
+		RLOG("vmid %u: client close unmap sync/invalidation failed; all mapped allocations are retained", c ? c->vmid : 0);
 
 	for (RtBuffer &b : buffers) {
-		if (b.owner == owner && b.host) {
+		if (b.owner != owner)
+			continue;
+		if (b.host) {
 			const uint64_t rounded = b.mapped || b.hostImported ? 0 : (b.bytes + GpuVm::kPageBytes - 1) &
 			                                                          ~(GpuVm::kPageBytes - 1);
 			if (c && c->hostBytes >= rounded)
@@ -4184,15 +4429,25 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			if (hostBytesTotal >= rounded)
 				hostBytesTotal -= rounded;
 			RLOG("vmid %u: host buffer unmapped during client close", c ? c->vmid : 0);
-			if (hostForgotten)
+			if (mappingsForgotten)
 				releaseHost(b);
 			else
 				leakHost(b);
-			b.owner = nullptr;
+		} else if (!b.foreign && mappingsForgotten) {
+			(b.device ? devHeap : heap).free(b.offset);
 		}
+		b.owner = nullptr;
+	}
+	for (RtProgram &p : programs) {
+		if (p.owner != owner)
+			continue;
+		if (mappingsForgotten)
+			heap.free(p.offset);
+		p.owner = nullptr;
 	}
 	if (nb || np)
-		RLOG("client closed: freed %u buffer(s), %u program(s)", nb, np);
+		RLOG("client closed: %s %u buffer(s), %u program(s)",
+		     mappingsForgotten ? "released" : "retained", nb, np);
 	if (c && vmEnabled) {
 		if (c->shared) {
 			/* No HQD to dequeue. Jobs still in flight on the shared queue must finish before the tables go: wait (bounded) for
@@ -4204,21 +4459,7 @@ void RDNA4Compute::rtRelease(const void *owner) {
 			else
 				wr(IpDiscovery::HwGc, Reg { 0, GcCtx1Cntl.dword + c->vmid - 1 }, 0);   // the context goes off before its tables do
 		} else {
-		/* Dequeue is deliberately polled: W1's interrupt path is not required. */
-		vmOpTrace("release before dequeue", c->vmid, c->pipe, c->queue);
-		grbmSelect(1, c->pipe, c->queue, c->vmid);
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 1);
-		bool inactive = false;
-		for (uint32_t us = 0; us < 100000; us += 10) {
-			if (!(rdGc(CpHqdActive) & 1)) { inactive = true; break; }
-			IODelay(10);
-		}
-		wr(IpDiscovery::HwGc, CpHqdDequeueReq, 0);
-		if (!inactive)
-			RLOG("vmid %u: queue MEC1 pipe %u queue %u dequeue timeout (ACTIVE 0x%08x)",
-			     c->vmid, c->pipe, c->queue, rdGc(CpHqdActive));
-		grbmSelect(0, 0, 0, 0);
-		vmOpTrace(inactive ? "release after dequeue" : "release after dequeue TIMEOUT", c->vmid, c->pipe, c->queue);
+			/* The private HQD was already dequeued above, before any client allocation was released. */
 		}
 		if (c->sp) {
 			/* Sparse tables: zero every backed page in VRAM, then give the chunks and the wired shadow pages back. */
@@ -4233,24 +4474,32 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		 * image before releasing the VMID or its backing VRAM. */
 		rdna4Step("rtRelease: clearing the page table in VRAM (vmTableSync)");
 		bzero(c->tableShadow, kVmTableBytes);
-		if (!vmTableSync(*c, 0, kVmTableBytes))
-			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
+		const bool tableCleared = vmTableSync(*c, 0, kVmTableBytes);
+		if (!tableCleared)
+			RLOG("vmid %u: page-table teardown clear failed; retaining backing allocation to prevent stale tables being reused", c->vmid);
 		rdna4Step("rtRelease: TLB invalidate");
-		vmInvalidate(c->vmid, "client close");
+		const bool invalidated = vmInvalidate(c->vmid, "client close");
 		rdna4Step("rtRelease: done");
-		vmidUsed[c->vmid] = false;
+		/* A timed-out invalidate means this VMID may still cache translations into
+		 * the old table. Keep both the VMID and its backing allocation retired. */
+		vmidUsed[c->vmid] = !invalidated;
+		if (!invalidated)
+			RLOG("vmid %u: close invalidate timed out; VMID and page-table backing retained until GPU reset", c->vmid);
 		if (!c->shared)
 			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
-		if (c->tableCpu)
-			heap.free(c->tableOffset);
-		else
-			devHeap.free(c->tableOffset);
+		if (tableCleared && invalidated) {
+			if (c->tableCpu)
+				heap.free(c->tableOffset);
+			else
+				devHeap.free(c->tableOffset);
+		}
 		if (c->shared)
-			RLOG("vmid %u: shared-queue client closed, freed its page tables", c->vmid);
+			RLOG("vmid %u: shared-queue client closed, page-table backing %s", c->vmid,
+			     tableCleared && invalidated ? "freed" : "retained after clear/invalidate failure");
 		else
-			RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
-			     c->vmid, c->pipe, c->queue);
+			RLOG("vmid %u: client closed, MEC1 pipe %u queue %u and page-table backing %s",
+			     c->vmid, c->pipe, c->queue, tableCleared && invalidated ? "freed" : "retained after clear/invalidate failure");
 		*c = RtClient {};
 	} else if (c) {
 		*c = RtClient {};
@@ -4290,8 +4539,26 @@ void RDNA4Compute::powerWillSleep() {
 	rtReady = false;
 	powerSleeping = true;
 	resumePending = false;
+	// If any engine cannot be proven idle, retain its backing and also close
+	// the PCI bus-master gate. Keep busMasterSet as ownership bookkeeping:
+	// this quarantined instance must never restore the old DMA permission.
+	auto containBusMaster = [this]() {
+		if (env.pci && (env.pci->configRead16(kIOPCIConfigCommand) & kIOPCICommandBusMaster)) {
+			env.pci->setBusMasterEnable(false);
+			RLOG("power: PCI bus mastering disabled while GPU DMA state remains quarantined");
+		}
+	};
 	RLOG("power: quiesce begin (runtime not ready)");
-	gcWake(0xfffffffdu);        // P7: lift GFXOFF explicitly first (every GC access below would wake it anyway); a clean log and no sleeping GC under the drain
+	gcWake(0xfffffffdu);
+	if (gcState == kGcHold) {
+		resumeQuarantined = true;
+		for (RtClient &client : clients)
+			if (client.active)
+				client.mapQuarantined = client.aborted = true;
+		RLOG("power: GC wake failed; skipping register teardown and retaining all old runtime/DMA allocations");
+		containBusMaster();
+		return;
+	}        // P7: lift GFXOFF explicitly first (every GC access below would wake it anyway); a clean log and no sleeping GC under the drain
 	// Calls serialize on rtLock, so no dispatch or SDMA fence can still be
 	// executing here. Drain every HQD with the same bounded poll used by W6.
 	auto drainQueue = [this](uint32_t pipe, uint32_t queue, uint32_t vmid,
@@ -4312,15 +4579,23 @@ void RDNA4Compute::powerWillSleep() {
 			RLOG("power: HQD %u/%u VMID %u timed out; invoking W6 recovery", pipe, queue, vmid);
 			inactive = recoverComputeQueue("sleep", recovery);
 		}
-		if (!inactive)
-			RLOG("power: HQD %u/%u VMID %u did not drain within the bound", pipe, queue, vmid);
+		if (!inactive) {
+			RLOG("power: HQD %u/%u VMID %u did not drain within the bound; wake allocations will be retained", pipe, queue, vmid);
+			resumeQuarantined = true;
+		}
 		grbmSelect(0, 0, 0, 0);
 		return inactive;
 	};
 	(void)drainQueue(0, 0, 0, nullptr);
 	/* rdna4-vmshared: the shared queues are the only HQDs the clients use; they are re-created at the next open after the wake. */
-	if (vmShared && sharedInit)
+	if (vmShared && sharedInit) {
 		sharedStopAll("system sleep");
+		for (const SharedQueue &q : sharedQ)
+			if (q.wedged) {
+				RLOG("power: shared compute queue failed to stop; wake allocations will be retained");
+				resumeQuarantined = true;
+			}
+	}
 	for (RtClient &c : clients) {
 		if (!c.active || !c.vmid || c.shared)
 			continue;
@@ -4346,22 +4621,93 @@ void RDNA4Compute::powerWillSleep() {
 	// IH DCN teardown is the hook that stops its vblank/pflip activity.
 	RLOG("power: IH disabled, flip timer hook stopped");
 	gfxSleepDrain();            // P7: give client gfx IBs 100 ms, then drop them (no wedge), BEFORE PFP/ME are halted
+	for (const RtClient &c : clients)
+		if (c.gfxQuarantined) {
+			RLOG("power: graphics work remains quarantined for VMID %u; wake allocations will be retained", c.vmid);
+			resumeQuarantined = true;
+		}
 	wr(IpDiscovery::HwGc, CpMeCntl, rdGc(CpMeCntl) | kCpMePfpHalt | kCpMeMeHalt);
 	wr(IpDiscovery::HwGc, CpMecRs64Cntl, rdGc(CpMecRs64Cntl) | kRs64Halt);
+
+	// A halted CP/MEC does not establish that SDMA has finished its own
+	// outstanding work. Disable each SDMA ring and wait for the engine's
+	// IDLE indication before dmaTeardown closes the AGP aperture or releases
+	// the pinned host buffer.
+	bool sdmaIdle = true;
+	for (uint32_t instance = 0; instance < GfxReg::kSdmaInstances; instance++) {
+		const auto rb = sdma(instance, SdmaQ0RbCntl);
+		const auto mcu = sdma(instance, SdmaMcuCntl);
+		wr(IpDiscovery::HwGc, rb, rd(IpDiscovery::HwGc, rb) &
+		   ~(kSdmaRbEnable | kSdmaRbRptrWriteback));
+		wr(IpDiscovery::HwGc, sdma(instance, SdmaQ0Doorbell), 0);
+		wr(IpDiscovery::HwGc, mcu, rd(IpDiscovery::HwGc, mcu) | kSdmaMcuHalt);
+		bool idle = false;
+		uint32_t status = 0xffffffffu;
+		for (uint32_t us = 0; us < 100000; us++) {
+			status = rd(IpDiscovery::HwGc, sdma(instance, SdmaStatusReg));
+			// An inaccessible MMIO read returns 0xffffffffu (all ones). Do not
+			// interpret that sentinel as hardware acknowledging IDLE.
+			if (status != 0xffffffffu && (status & kSdmaIdle)) {
+				idle = true;
+				break;
+			}
+			IODelay(1);
+		}
+		if (!idle) {
+			sdmaIdle = false;
+			resumeQuarantined = true;
+			RLOG("power: SDMA%u did not acknowledge IDLE after halt (status 0x%08x); retaining DMA backing", instance, status);
+		}
+	}
+	if (sdmaIdle) {
+		wr(IpDiscovery::HwGc, sdma(0, SdmaCntl),
+		   rd(IpDiscovery::HwGc, sdma(0, SdmaCntl)) & ~1u);
+	} else {
+		RLOG("power: global SDMA disable skipped because an instance did not become idle");
+	}
 	dmaTeardown("system sleep");
+	if (resumeQuarantined)
+		containBusMaster();
 	RLOG("power: quiesce complete; compute engines halted");
 }
 
 void RDNA4Compute::resetRuntimeForResume() {
 	if (!rtLock)
 		return;
+	// A successful queue drain is not a GPU reset. Before releasing any old
+	// page-table or buffer backing, disable every client VM context and obtain
+	// an invalidate acknowledgement for every VMID. This is the hardware
+	// proof that stale translations cannot outlive the allocations below.
+	gcWake(0xfffffffdu);
 	Locked g(rtLock);
+	if (gcState == kGcHold) {
+		resumeQuarantined = true;
+		for (RtClient &client : clients)
+			if (client.active)
+				client.mapQuarantined = client.aborted = true;
+		RLOG("power: GC wake failed; retaining all old runtime allocations without touching VM registers");
+		return;
+	}
+	for (uint32_t vmid = 1; vmid < 16; vmid++) {
+		const Reg context { 0, GcCtx1Cntl.dword + vmid - 1 };
+		wr(IpDiscovery::HwGc, context, 0);
+		if (rdGc(context) != 0 || !vmInvalidate(vmid, "resume context disable")) {
+			resumeQuarantined = true;
+			for (RtClient &client : clients)
+				if (client.active)
+					client.mapQuarantined = client.aborted = true;
+			RLOG("power: VMID %u context disable/invalidate was not acknowledged; retaining all old runtime allocations", vmid);
+			return;
+		}
+	}
 	for (RtBuffer &b : buffers) {
 		if (!b.owner)
 			continue;
 		if (b.host)
 			releaseHost(b);
-		else if (b.device)
+		else if (b.foreign) {
+			/* rtMapVram does not own the physical allocation, even on reset. */
+		} else if (b.device)
 			devHeap.free(b.offset);
 		else
 			heap.free(b.offset);
@@ -4391,6 +4737,8 @@ void RDNA4Compute::resetRuntimeForResume() {
 		c.gfxFenceCpu = nullptr;                 // W12k: the ring is re-initialised by the wake's stageGfxRing; nothing of this client is pending
 		c.gfxFenceMc = 0;
 		c.gfxOutstanding = 0;
+		c.gfxQuarantined = false;
+		c.mapQuarantined = false;   // every old VM context was disabled and its TLB invalidate acknowledged above
 	}
 	bzero(vmidUsed, sizeof(vmidUsed));
 	bzero(queueUsed, sizeof(queueUsed));
@@ -4415,7 +4763,7 @@ void RDNA4Compute::resetRuntimeForResume() {
 	rtWedged = false;
 	rtReady = false;
 	rtGeneration++;
-	RLOG("power: old runtime buffers, heaps and VM contexts discarded; client objects retained as aborted");
+	RLOG("power: old runtime buffers, heaps and VM contexts discarded after all VMID invalidations acknowledged; client objects retained as aborted");
 }
 
 // ---------------------------------------------------------------------------
@@ -4423,12 +4771,32 @@ void RDNA4Compute::resetRuntimeForResume() {
 // ---------------------------------------------------------------------------
 
 // One packet on SDMA0 queue 0 with a FENCE after it; waits for the fence.
+// Serialization contract: after publication, callers hold rtLock (the
+// runtime entry points and their helpers do); during bring-up, only the
+// exclusive bring-up thread submits work, before rtReady is published.
+// stageSdma has its own direct ring test under that same bring-up exclusion.
 bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeoutMs) {
+	// Once any engine or runtime path is quarantined, do not submit more work
+	// to the ring. A later successful fence cannot retroactively prove that
+	// earlier timed-out work stopped touching its backing memory.
+	if (sdmaQuarantined || resumeQuarantined)
+		return false;
+
+	// Preflight the whole packet + fence + trap before touching the ring.
+	// Otherwise a late emit failure could leave a partial command sequence
+	// ahead of the next submission, even though this call never kicked it.
+	const uint64_t totalDwords = static_cast<uint64_t>(dwords) + Sdma::kFenceDwords + Sdma::kTrapDwords;
+	const uint64_t ringDwords = sdmaRing.sizeBytes() / 4;
+	if (!pkt || !dwords || !ringDwords || totalDwords >= ringDwords ||
+	    sdmaRing.wptr() > UINT64_MAX - totalDwords * 4)
+		return false;
+
 	uint32_t fence[Sdma::kFenceDwords];
 	uint32_t trap[Sdma::kTrapDwords];
 	const uint32_t value = ++sdmaFence;
-	Sdma::fence(fence, poolMc(kSdmaFenceOffset), value);
-	Sdma::trap(trap);
+	if (Sdma::fence(fence, poolMc(kSdmaFenceOffset), value) != Sdma::kFenceDwords ||
+	    Sdma::trap(trap) != Sdma::kTrapDwords)
+		return false;
 	if (!sdmaRing.emit(pkt, dwords) || !sdmaRing.emit(fence, Sdma::kFenceDwords) ||
 	    !sdmaRing.emit(trap, Sdma::kTrapDwords))
 		return false;
@@ -4436,8 +4804,11 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	if (ihActive) {
 		uint64_t ns = 0;
 		const bool done = ihWaitFence(poolDw(kSdmaFenceOffset), value, timeoutMs, false, "dma", ns);
-		if (!done)
+		if (!done) {
 			RLOG("dma: SDMA queue remains wedged; this gfx12 path has no source-backed no-MES queue reset");
+			sdmaQuarantined = true;
+			resumeQuarantined = true;
+		}
 		return done;
 	}
 	uint64_t t0 = mach_absolute_time(), span = 0;
@@ -4457,6 +4828,8 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 	// no source-backed no-MES queue reset sequence for this bring-up path, so a
 	// timed-out SDMA queue remains wedged rather than risking the display.
 	RLOG("dma: SDMA queue remains wedged; no source-backed no-MES queue reset");
+	sdmaQuarantined = true;
+	resumeQuarantined = true;
 	logGcFault("dma");
 	return false;
 }
@@ -4464,24 +4837,46 @@ bool RDNA4Compute::sdmaRun(const uint32_t *pkt, uint32_t dwords, uint32_t timeou
 // One COPY_LINEAR between VRAM and the bounce buffer, through the AGP
 // aperture (bus address b is MC agpStart + b).
 bool RDNA4Compute::bounceCopy(uint64_t vram, uint32_t hostOffset, uint32_t bytes, bool toGpu) {
-	if (!bytes || hostOffset > kBounceBytes || bytes > kBounceBytes - hostOffset)
+	constexpr uint32_t kPiece = 4u << 20;
+	if (!bytes || hostOffset > kBounceBytes || bytes > kBounceBytes - hostOffset ||
+	    vram > UINT64_MAX - (static_cast<uint64_t>(bytes) - 1))
 		return false;
 	const uint64_t host = agpStart + bounceBus + hostOffset;
-	uint32_t pkt[Sdma::kCopyDwords];
-	Sdma::copyLinear(pkt, toGpu ? host : vram, toGpu ? vram : host, bytes);
-	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+	for (uint32_t at = 0; at < bytes;) {
+		const uint32_t n = bytes - at < kPiece ? bytes - at : kPiece;
+		const uint64_t hostAt = host + at, vramAt = vram + at;
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (Sdma::copyLinear(pkt, toGpu ? hostAt : vramAt, toGpu ? vramAt : hostAt, n) != Sdma::kCopyDwords ||
+		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000))
+			return false;
+		at += n;
+	}
+	return true;
 }
 
 // Extend the AGP aperture (and the system aperture over it, as dmaInit sets them) to reach bus address busEnd - 1, in whole GiB. amdgpu sizes it
 // to the largest free hole of the MC space; here it grows on demand from the bounce buffer's end. False without DMA, or with an IOMMU in between
 // (the bounce buffer's bus address then differs from its physical one, and a bus address names no fixed memory). Caller holds rtLock.
 bool RDNA4Compute::agpReach(uint64_t busEnd) {
-	if (!dmaReady || !busEnd || bounceBus != bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone))
+	constexpr uint64_t kMcAddressLimit = 1ull << 48;
+	constexpr uint64_t kApertureGranule = 1ull << 30;
+	if (!dmaReady || !bounce || !busEnd ||
+	    bounceBus != bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) ||
+	    agpStart >= kMcAddressLimit || busEnd > kMcAddressLimit - agpStart)
 		return false;
-	if (agpStart + busEnd - 1 <= agpEnd)
+	const uint64_t requestedEnd = agpStart + busEnd - 1;
+	if (requestedEnd < agpStart || requestedEnd >= kMcAddressLimit)
+		return false;
+	if (requestedEnd <= agpEnd)
 		return true;
-	const uint64_t end = agpStart + ((busEnd + (1ull << 30) - 1) & ~((1ull << 30) - 1)) - 1;
-	if (end >= (1ull << 48))
+	if (busEnd > UINT64_MAX - (kApertureGranule - 1))
+		return false;
+	const uint64_t roundedBusEnd =
+		(busEnd + kApertureGranule - 1) & ~(kApertureGranule - 1);
+	if (!roundedBusEnd || roundedBusEnd > kMcAddressLimit - agpStart)
+		return false;
+	const uint64_t end = agpStart + roundedBusEnd - 1;
+	if (end >= kMcAddressLimit)
 		return false;
 	wr(IpDiscovery::HwGc, GcAgpTop, static_cast<uint32_t>(end >> 24));
 	wr(IpDiscovery::HwGc, GcSysApertureHigh, static_cast<uint32_t>(end >> 18));
@@ -4491,21 +4886,22 @@ bool RDNA4Compute::agpReach(uint64_t busEnd) {
 	return true;
 }
 
-// A buffer's VRAM before it goes to its owner: the last one's data must not reach the next. CONST_FILL in pieces of 64 MiB, well
-// within the packet's byte count.
+// A buffer's VRAM before it goes to its owner: the last one's data must not reach the next. Split into SDMA 7's 4 MiB packet limit.
 bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
-	constexpr uint64_t kPiece = 64ull << 20;
+	// SDMA 7's documented buffer-function limit is 4 MiB per packet.
+	constexpr uint64_t kPiece = 4ull << 20;
 
-	if (!dmaReady || (bytes & 3))
+	if (!dmaReady || !bytes || (bytes & 3) || mc > UINT64_MAX - (bytes - 1))
 		return false;
 
-	for (uint64_t at = 0; at < bytes; at += kPiece) {
+	for (uint64_t at = 0; at < bytes;) {
 		const uint32_t n = static_cast<uint32_t>(bytes - at < kPiece ? bytes - at : kPiece);
 		uint32_t pkt[Sdma::kFillDwords];
 
-		Sdma::constFill(pkt, mc + at, 0, n);
-		if (!sdmaRun(pkt, Sdma::kFillDwords, 2000))
+		if (Sdma::constFill(pkt, mc + at, 0, n) != Sdma::kFillDwords ||
+		    !sdmaRun(pkt, Sdma::kFillDwords, 2000))
 			return false;
+		at += n;
 	}
 
 	return true;
@@ -4514,24 +4910,42 @@ bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
 // M2: one CONST_FILL / COPY_LINEAR on system memory by bus address (pvgpu.cpp runs the fake paravirtual GPU's blits with these).
 bool RDNA4Compute::sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes) {
 	Locked g(rtLock);
-	if (!bytes || !agpReach(bus + bytes))
+	constexpr uint32_t kPiece = 4u << 20;
+	if (!bytes || bus > UINT64_MAX - bytes || !agpReach(bus + bytes))
 		return false;
-	uint32_t pkt[Sdma::kFillDwords];
-	Sdma::constFill(pkt, agpStart + bus, pattern, bytes);
-	return sdmaRun(pkt, Sdma::kFillDwords, 2000);
+	const uint64_t base = agpStart + bus;
+	for (uint32_t at = 0; at < bytes;) {
+		const uint32_t n = bytes - at < kPiece ? bytes - at : kPiece;
+		uint32_t pkt[Sdma::kFillDwords];
+		if (Sdma::constFill(pkt, base + at, pattern, n) != Sdma::kFillDwords ||
+		    !sdmaRun(pkt, Sdma::kFillDwords, 2000))
+			return false;
+		at += n;
+	}
+	return true;
 }
 
 bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
 	Locked g(rtLock);
-	if (!bytes || !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
+	constexpr uint32_t kPiece = 4u << 20;
+	if (!bytes || srcBus > UINT64_MAX - bytes || dstBus > UINT64_MAX - bytes ||
+	    !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
 		return false;
-	uint32_t pkt[Sdma::kCopyDwords];
-	Sdma::copyLinear(pkt, agpStart + srcBus, agpStart + dstBus, bytes);
-	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
+	const uint64_t src = agpStart + srcBus;
+	const uint64_t dst = agpStart + dstBus;
+	for (uint32_t at = 0; at < bytes;) {
+		const uint32_t n = bytes - at < kPiece ? bytes - at : kPiece;
+		uint32_t pkt[Sdma::kCopyDwords];
+		if (Sdma::copyLinear(pkt, src + at, dst + at, n) != Sdma::kCopyDwords ||
+		    !sdmaRun(pkt, Sdma::kCopyDwords, 2000))
+			return false;
+		at += n;
+	}
+	return true;
 }
 
 bool RDNA4Compute::dmaInit() {
-	if (!poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
+	if (!env.pci || !env.disc || !poolCpu || !sdmaRing.sizeBytes() || !sv.fbMcTop) {
 		RLOG("dma: not set up: %s", !sdmaRing.sizeBytes() ? "no SDMA queue" : "no compute pool");
 		return false;
 	}
@@ -4560,12 +4974,30 @@ bool RDNA4Compute::dmaInit() {
 	}
 	bounceBus = seg.fIOVMAddr;
 
+	// The AGP aperture below addresses system memory by its physical bus
+	// address. agpReach() already refuses an IOMMU-translated address; apply
+	// the same rule before the initial self-test can submit any DMA.
+	const uint64_t bouncePhysical = bounce->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+	constexpr uint64_t kDmaAddressLimit = 1ull << 40;
+	constexpr uint64_t kMcAddressLimit = 1ull << 48;
+	if (bounceBus != bouncePhysical || (bounceBus & 0xfff) ||
+	    bounceBus >= kDmaAddressLimit || kBounceBytes > kDmaAddressLimit - bounceBus ||
+	    sv.fbMcTop > UINT64_MAX - (16ull << 30)) {
+		dmaTeardown("the bounce buffer DMA address is not a directly addressable physical range");
+		return false;
+	}
+
 	// 3. amdgpu's AGP layout (amdgpu_gmc_agp_location, amdgpu_gmc_agp_addr,
 	//    gfxhub_v12_0_init_system_aperture_regs): AGP_BASE 0, the aperture
 	//    16 GiB-aligned right after the FB, bus address b at agpStart + b,
 	//    and the system aperture extended over it. It reaches bus addresses
 	//    up to the bounce buffer's end, not all of memory.
 	agpStart = (sv.fbMcTop + (16ull << 30)) & ~((16ull << 30) - 1);
+	if (agpStart >= kMcAddressLimit || bounceBus > kMcAddressLimit - agpStart ||
+	    kBounceBytes - 1 > kMcAddressLimit - agpStart - bounceBus) {
+		dmaTeardown("the AGP aperture range exceeds the GPU MC address width");
+		return false;
+	}
 	agpEnd = agpStart + bounceBus + kBounceBytes - 1;
 	wr(IpDiscovery::HwGc, GcAgpBase, 0);
 	wr(IpDiscovery::HwGc, GcAgpBot, static_cast<uint32_t>(agpStart >> 24));
@@ -4646,8 +5078,12 @@ bool RDNA4Compute::dmaInit() {
 		*poolDw(kDmaTestOffset + 4 * i) = pat2(i);
 	flushHdp();
 	uint32_t move[Sdma::kCopyDwords];
-	Sdma::copyLinear(move, poolMc(kDmaTestOffset + n), poolMc(kDmaTestOffset), n);
-	const bool moved = sdmaRun(move, Sdma::kCopyDwords, 2000);
+	const bool moved = Sdma::copyLinear(move, poolMc(kDmaTestOffset + n), poolMc(kDmaTestOffset), n) == Sdma::kCopyDwords &&
+	                    sdmaRun(move, Sdma::kCopyDwords, 2000);
+	if (!moved) {
+		dmaTeardown("the VRAM-to-VRAM self-test copy did not complete");
+		return false;
+	}
 	uint32_t wrongMoved = 0, firstMoved = 0;
 	for (uint32_t i = 0; i < n / 4; i++) {
 		const uint32_t m = *poolDw(kDmaTestOffset + 4 * i);
@@ -4683,6 +5119,11 @@ bool RDNA4Compute::dmaInit() {
 }
 
 void RDNA4Compute::dmaTeardown(const char *why) {
+        if (resumeQuarantined || sdmaQuarantined) {
+                resumeQuarantined = true;
+                RLOG("dma: teardown deferred — GPU work is not proven quiescent; retaining ring, AGP aperture and pinned bounce memory");
+                return;
+        }
 	RLOG("dma: off — %s; transfers stay on the CPU through the BAR", why);
 	dmaReady = false;
 	wr(IpDiscovery::HwGc, GcAgpBase, 0);

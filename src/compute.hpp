@@ -898,6 +898,8 @@ private:
 		uint32_t gfxFence { 0 };
 		uint32_t gfxFences[kMaxGfxIbOutstanding] {};
 		uint32_t gfxOutstanding { 0 };
+		bool gfxQuarantined { false };   // gfx ring wedged while this client's IBs may still be in flight
+		bool mapQuarantined { false };  // page-table rollback could not be synced; retain this client's allocations until reset
 		uint64_t *tableShadow { nullptr };
 		Pm4::Queue pm4;
 		bool active { false };
@@ -922,6 +924,8 @@ private:
 	bool           powerSleeping { false };
 	bool           resumed { false };
 	bool           resumePending { false };
+	bool           resumeQuarantined { false }; // unsafe engine state; retain old runtime allocations until a proven reset
+	bool           sdmaQuarantined { false };   // SDMA fence timed out; its ring/bounce memory may still be in use
 	bool           hangRecoveryEnabled { false }; // opt in with rdna4-hang=1
 	uint32_t       rtStage { 0 };
 	bool           vmEnabled { false };
@@ -1111,7 +1115,7 @@ private:
 	bool vmSyncCpu(RtClient &client, uint64_t va, uint64_t end);
 	bool vmMapHost(RtClient &client, uint64_t va, const uint64_t *pageBuses,
 	               uint64_t bytes, bool executable, bool readOnly = false);   // readOnly: RDNA4_HOST_READ_ONLY, no WRITEABLE
-	void vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
+	bool vmUnmap(RtClient &client, uint64_t va, uint64_t bytes);
 	bool vmContextInit(RtClient &client);
 	bool vmInvalidate(uint32_t vmid, const char *tag);
 	bool vmInvalidateOwned(RtClient &c, const char *tag);

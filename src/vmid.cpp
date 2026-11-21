@@ -198,6 +198,16 @@ bool Pool::forget(uintptr_t owner, bool force, uint32_t &vmid) {
 	return true;
 }
 
+void Pool::quarantine(uint32_t vmid) {
+	if (vmid < kFirst || vmid > kLast)
+		return;
+	Slot &s = slot[vmid];
+	if (s.owner)
+		counters.unbinds++;
+	s = Slot {};
+	s.pinned = true;       // unavailable to grab()/pin() until unbindAll() after reset
+}
+
 void Pool::unbindAll() {
 	for (uint32_t v = kFirst; v <= kLast; v++)
 		slot[v] = Slot {};

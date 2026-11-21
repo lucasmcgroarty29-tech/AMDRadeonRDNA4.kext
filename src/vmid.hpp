@@ -90,6 +90,9 @@ public:
 	// work in flight, unless `force` (after a hang recovery has killed the work).
 	bool forget(uintptr_t owner, bool force, uint32_t &vmid);
 
+	// A VMID whose invalidate timed out is never reused until a GPU reset; stale translations may remain.
+	void quarantine(uint32_t vmid);
+
 	// After a wake or a GPU reset every context is gone: nothing is bound any more, pins included.
 	void unbindAll();
 

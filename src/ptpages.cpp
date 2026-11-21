@@ -29,7 +29,7 @@ uint64_t Table::offsetOf(uint32_t logical) const {
 }
 
 bool Table::page(uint32_t logical, const Backend &b, uint64_t &heapOffset) {
-	if (logical >= kMaxPages)
+	if (logical >= kMaxPages || !b.allocChunk || !b.freeChunk)
 		return false;
 	if (handle[logical]) {
 		heapOffset = offsetOf(logical);
@@ -53,8 +53,25 @@ bool Table::page(uint32_t logical, const Backend &b, uint64_t &heapOffset) {
 			}
 		}
 		uint64_t off = 0;
-		if (freeIdx == kMaxChunks || !b.allocChunk || !b.allocChunk(b.context, off))
+		if (freeIdx == kMaxChunks || !b.allocChunk(b.context, off))
 			return false;
+		/* The backend contract is a 64 KiB, granule-aligned chunk. Reject a
+		 * broken allocator before recording an offset that could alias pages
+		 * or wrap when a slot is added. */
+		constexpr uint64_t chunkBytes = static_cast<uint64_t>(kChunkPages) * kPageBytes;
+		bool overlaps = false;
+		if (off <= ~0ull - chunkBytes) {
+			for (uint32_t i = 0; i < kMaxChunks; i++) {
+				if (!chunkLive[i])
+					continue;
+				const uint64_t other = chunkOff[i];
+				overlaps |= off < other + chunkBytes && other < off + chunkBytes;
+			}
+		}
+		if ((off & (chunkBytes - 1)) || off > ~0ull - chunkBytes || overlaps) {
+			b.freeChunk(b.context, off);
+			return false;
+		}
 		chunkLive[freeIdx] = true;
 		chunkOff[freeIdx] = off;
 		chunkMask[freeIdx] = 0;
@@ -151,19 +168,23 @@ static uint64_t sparseKey(uint32_t level, uint64_t key) {
 }
 
 bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page &out) {
+	if (!h.allocShadow || !h.freeShadow || !h.physOf || !h.be.allocChunk || !h.be.freeChunk)
+		return false;
 	const uint64_t k = sparseKey(level, key);
 	int id = dir.find(k);
+	uint64_t heapOffset = 0, physical = 0;
+	bool physicalReady = false;
 	if (id < 0) {
 		if (!create || nextId >= kMaxPages)
 			return false;
 		const uint32_t fresh = nextId;
-		uint64_t heapOffset = 0;
 		if (!table.page(fresh, h.be, heapOffset))
 			return false;
-		uint64_t *mem = h.allocShadow ? h.allocShadow(h.context) : nullptr;
-		uint64_t physical = 0;
-		if (!mem || !h.physOf || !h.physOf(h.context, heapOffset, physical) || !dir.insert(k, static_cast<uint16_t>(fresh))) {
-			if (mem && h.freeShadow)
+		uint64_t *mem = h.allocShadow(h.context);
+		if (!mem || !h.physOf(h.context, heapOffset, physical) ||
+		    (physical & (kPageBytes - 1)) || physical > 0x0000FFFFFFFFF000ull ||
+		    !dir.insert(k, static_cast<uint16_t>(fresh))) {
+			if (mem)
 				h.freeShadow(h.context, mem);
 			table.drop(fresh, h.be);
 			return false;
@@ -171,11 +192,16 @@ bool Sparse::get(const Host &h, uint32_t level, uint64_t key, bool create, Page 
 		shadow[fresh] = mem;
 		nextId++;
 		markDirty(fresh);       // a new page must reach VRAM (zeros) before anything points at it
+		physicalReady = true;
 		id = static_cast<int>(fresh);
 	}
-	uint64_t heapOffset = table.offsetOf(static_cast<uint32_t>(id));
-	uint64_t physical = 0;
-	if (!h.physOf(h.context, heapOffset, physical))
+	if (id < 0 || static_cast<uint32_t>(id) >= nextId || !shadow[id])
+		return false;
+	if (heapOffset == 0)
+		heapOffset = table.offsetOf(static_cast<uint32_t>(id));
+	if (!physicalReady && !h.physOf(h.context, heapOffset, physical))
+		return false;
+	if ((physical & (kPageBytes - 1)) || physical > 0x0000FFFFFFFFF000ull)
 		return false;
 	out.entries = shadow[id];
 	out.phys = physical;
