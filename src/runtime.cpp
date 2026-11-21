@@ -4240,8 +4240,9 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		 * image before releasing the VMID or its backing VRAM. */
 		rdna4Step("rtRelease: clearing the page table in VRAM (vmTableSync)");
 		bzero(c->tableShadow, kVmTableBytes);
-		if (!vmTableSync(*c, 0, kVmTableBytes))
-			RLOG("vmid %u: page-table teardown clear failed", c->vmid);
+		const bool tableCleared = vmTableSync(*c, 0, kVmTableBytes);
+		if (!tableCleared)
+			RLOG("vmid %u: page-table teardown clear failed; retaining backing allocation to prevent stale tables being reused", c->vmid);
 		rdna4Step("rtRelease: TLB invalidate");
 		vmInvalidate(c->vmid, "client close");
 		rdna4Step("rtRelease: done");
@@ -4249,15 +4250,18 @@ void RDNA4Compute::rtRelease(const void *owner) {
 		if (!c->shared)
 			queueUsed[c->pipe][c->queue] = false;
 		IOFree(c->tableShadow, kVmTableBytes);
-		if (c->tableCpu)
-			heap.free(c->tableOffset);
-		else
-			devHeap.free(c->tableOffset);
+		if (tableCleared) {
+			if (c->tableCpu)
+				heap.free(c->tableOffset);
+			else
+				devHeap.free(c->tableOffset);
+		}
 		if (c->shared)
-			RLOG("vmid %u: shared-queue client closed, freed its page tables", c->vmid);
+			RLOG("vmid %u: shared-queue client closed, page-table backing %s", c->vmid,
+			     tableCleared ? "freed" : "retained after clear failure");
 		else
-			RLOG("vmid %u: client closed, freed MEC1 pipe %u queue %u and page tables",
-			     c->vmid, c->pipe, c->queue);
+			RLOG("vmid %u: client closed, MEC1 pipe %u queue %u and page-table backing %s",
+			     c->vmid, c->pipe, c->queue, tableCleared ? "freed" : "retained after clear failure");
 		*c = RtClient {};
 	} else if (c) {
 		*c = RtClient {};
