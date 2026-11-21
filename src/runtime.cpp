@@ -2092,8 +2092,8 @@ IOReturn RDNA4Compute::rtOpenShared(const void *owner, uint32_t slot, RtClient *
 		/* Zeroed by SDMA and only the root's and directories' pages written through the BAR: CPU writes to the pool make some
 		 * 12 MB/s, the whole table a stall of 650 ms in the client's first draw (the boot's progress bar stopped). */
 		uint32_t fill[Sdma::kFillDwords];
-		Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes);
-		const bool zeroed = sdmaRun(fill, Sdma::kFillDwords, 2000);
+		const bool zeroed = Sdma::constFill(fill, poolMc(table), 0, kVmTableBytes) == Sdma::kFillDwords &&
+		                    sdmaRun(fill, Sdma::kFillDwords, 2000);
 
 		memcpy(poolWc + table, c->tableShadow, zeroed ? 0x3000 : kVmTableBytes);
 		__builtin_ia32_sfence();
@@ -4782,7 +4782,8 @@ bool RDNA4Compute::bounceCopy(uint64_t vram, uint32_t hostOffset, uint32_t bytes
 		return false;
 	const uint64_t host = agpStart + bounceBus + hostOffset;
 	uint32_t pkt[Sdma::kCopyDwords];
-	Sdma::copyLinear(pkt, toGpu ? host : vram, toGpu ? vram : host, bytes);
+	if (Sdma::copyLinear(pkt, toGpu ? host : vram, toGpu ? vram : host, bytes) != Sdma::kCopyDwords)
+		return false;
 	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
 }
 
@@ -4830,8 +4831,8 @@ bool RDNA4Compute::vramZero(uint64_t mc, uint64_t bytes) {
 		const uint32_t n = static_cast<uint32_t>(bytes - at < kPiece ? bytes - at : kPiece);
 		uint32_t pkt[Sdma::kFillDwords];
 
-		Sdma::constFill(pkt, mc + at, 0, n);
-		if (!sdmaRun(pkt, Sdma::kFillDwords, 2000))
+		if (Sdma::constFill(pkt, mc + at, 0, n) != Sdma::kFillDwords ||
+		    !sdmaRun(pkt, Sdma::kFillDwords, 2000))
 			return false;
 	}
 
@@ -4844,7 +4845,8 @@ bool RDNA4Compute::sysFill(uint64_t bus, uint32_t pattern, uint32_t bytes) {
 	if (!bytes || bus > UINT64_MAX - bytes || !agpReach(bus + bytes))
 		return false;
 	uint32_t pkt[Sdma::kFillDwords];
-	Sdma::constFill(pkt, agpStart + bus, pattern, bytes);
+	if (Sdma::constFill(pkt, agpStart + bus, pattern, bytes) != Sdma::kFillDwords)
+		return false;
 	return sdmaRun(pkt, Sdma::kFillDwords, 2000);
 }
 
@@ -4854,7 +4856,8 @@ bool RDNA4Compute::sysCopy(uint64_t srcBus, uint64_t dstBus, uint32_t bytes) {
 	    !agpReach((srcBus > dstBus ? srcBus : dstBus) + bytes))
 		return false;
 	uint32_t pkt[Sdma::kCopyDwords];
-	Sdma::copyLinear(pkt, agpStart + srcBus, agpStart + dstBus, bytes);
+	if (Sdma::copyLinear(pkt, agpStart + srcBus, agpStart + dstBus, bytes) != Sdma::kCopyDwords)
+		return false;
 	return sdmaRun(pkt, Sdma::kCopyDwords, 2000);
 }
 
@@ -4992,8 +4995,8 @@ bool RDNA4Compute::dmaInit() {
 		*poolDw(kDmaTestOffset + 4 * i) = pat2(i);
 	flushHdp();
 	uint32_t move[Sdma::kCopyDwords];
-	Sdma::copyLinear(move, poolMc(kDmaTestOffset + n), poolMc(kDmaTestOffset), n);
-	const bool moved = sdmaRun(move, Sdma::kCopyDwords, 2000);
+	const bool moved = Sdma::copyLinear(move, poolMc(kDmaTestOffset + n), poolMc(kDmaTestOffset), n) == Sdma::kCopyDwords &&
+	                    sdmaRun(move, Sdma::kCopyDwords, 2000);
 	if (!moved) {
 		dmaTeardown("the VRAM-to-VRAM self-test copy did not complete");
 		return false;
