@@ -782,9 +782,10 @@ bool RDNA4Compute::vmUnmap(RtClient &c, uint64_t va, uint64_t bytes) {
 		TreeCtx tc { this, &c };   // treeUnmap never backs a page just to clear a PTE in it
 		const GpuVmTable::Tree tree { treePageThunk, treeDirtyThunk, &tc };
 		GpuVmTable::treeUnmap(tree, va, end);
-		if (!sparseSync(c))
+		const bool synced = sparseSync(c);
+		if (!synced)
 			RLOG("vmid %u: page-table unmap sync failed", c.vmid);
-		return !c.sp || sparseSync(c);
+		return synced;
 	}
 	PtCtx ctx { this, &c };
 	const GpuVmTable::Access access { ptEntryThunk, ptPhysThunk, &ctx };
@@ -2860,18 +2861,18 @@ IOReturn RDNA4Compute::rtFree(const void *owner, uint64_t handle) {
 	if (c && c->gfxOutstanding && owner != idleFreeOwner)
 		gfxClientDrain(*c, "buffer free");   // W12k: an outstanding gfx IB may still use it
 	const bool host = b->host;
-	if (c && b->va)
-		vmUnmap(*c, b->va, b->bytes);
+	const bool unmapped = !b->va || (c && vmUnmap(*c, b->va, b->bytes));
 	/* Every unmap is followed by an invalidation before the memory goes back to its heap
 	 * (amdgpu sets tlb_seq on a cleared PTE and flushes before the VMID's next job,
 	 * amdgpu_vm.c:1272). Device buffers used to skip it: a cached translation could then
 	 * still reach VRAM that the heap hands to another client. Inferred from the code, not
 	 * measured on the card. When the invalidation times out the memory is never reused: the
 	 * GPU may still reach it, and host pages handed back to the kernel would take its writes. */
-	const bool forgotten = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
+	const bool invalidated = !c || !(b->va || host) || vmInvalidateOwned(*c, host ? "host unmap" : "device unmap");
+	const bool forgotten = unmapped && invalidated;
 
 	if (!forgotten)
-		RLOG("vmid %u: %s buffer unmap invalidation timed out: its memory is kept, not reused", c->vmid, host ? "host" : "device");
+		RLOG("vmid %u: %s buffer unmap sync/invalidation failed: its memory is kept, not reused", c ? c->vmid : 0, host ? "host" : "device");
 
 	if (c && b->va && forgotten)
 		vaGive(*c, b->va, b->bytes);   // after the invalidation: nothing cached reaches the range when it is mapped again
@@ -3128,15 +3129,20 @@ IOReturn RDNA4Compute::rtUnload(const void *owner, uint64_t program) {
 	RtProgram *p = programFor(owner, program);
 	if (!p)
 		return kIOReturnBadArgument;
+	bool forgotten = !vmClientFor(owner);
 	if (RtClient *c = vmClientFor(owner)) {
-		vmUnmap(*c, p->va, heap.lengthOf(p->offset));
-		/* As rtFree: invalidate before the code pages return to the heap. */
-		if (!vmInvalidateOwned(*c, "program unmap"))
-			RLOG("vmid %u: program unmap invalidation timed out", c->vmid);
-
-		vaGive(*c, p->va, p->vaBytes);   // after the invalidation, as rtFree
+		const bool unmapped = vmUnmap(*c, p->va, heap.lengthOf(p->offset));
+		/* As rtFree: both the page-table write and TLB invalidate must complete
+		 * before the VA or code allocation can be handed to another client. */
+		const bool invalidated = unmapped && vmInvalidateOwned(*c, "program unmap");
+		forgotten = unmapped && invalidated;
+		if (forgotten)
+			vaGive(*c, p->va, p->vaBytes);
+		else
+			RLOG("vmid %u: program unmap sync/invalidation failed; code allocation retained", c->vmid);
 	}
-	heap.free(p->offset);
+	if (forgotten)
+		heap.free(p->offset);
 	p->owner = nullptr;
 	return kIOReturnSuccess;
 }
