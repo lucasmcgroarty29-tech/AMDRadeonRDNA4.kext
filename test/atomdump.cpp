@@ -4827,6 +4827,19 @@ static int testSparseTree() {
 	const uint64_t top = GpuVm::kVaEnd - 0x2000;
 	f += check(treeMap(e, top, MC + 0x300000, 0x2000) && treeResolves(e, top, MC + 0x300000, 0x2000), "tree: the last two pages of the 48-bit space translate");
 	f += check(!GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V - 0x1000, V + 0x1000, 0x1000, false), "tree: a map starting below kVaStart is refused");
+	{
+		const uint32_t pagesBeforeInvalid = e.sp.pages();
+		const uint64_t lastPage = GpuVm::kVaEnd - GpuVm::kPageBytes;
+		const bool pastEnd = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, lastPage,
+		                                             GpuVm::kVaEnd + GpuVm::kPageBytes, 0x100000, false);
+		const bool physicalOverflow = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x100000,
+		                                                       V + 0x101000, GpuVm::kPhysicalMask + GpuVm::kPageBytes, false);
+		const bool physicalMisaligned = GpuVmTable::treeMapVram(e.tree(), GpuVmTable::Policy {}, V + 0x102000,
+		                                                         V + 0x103000, 0x100001, false);
+		f += check(!pastEnd && !physicalOverflow && !physicalMisaligned && e.sp.pages() == pagesBeforeInvalid &&
+		           !e.translate(lastPage, phys),
+		           "tree: invalid VA tail, out-of-range physical page and misaligned physical address are rejected before allocation or mapping");
+	}
 	f += check(treeResolves(e, cross, crossMc, 0x20000) && treeResolves(e, V + 0x1000, MC, 0x3000), "tree: the earlier mappings are undisturbed by the later ones");
 
 	// Unmap: PTEs go (through the dirty path), pages stay, nothing is created for a range that was never mapped.
