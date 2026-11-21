@@ -2770,19 +2770,33 @@ IOReturn RDNA4Compute::mapHostLocked(const void *owner, IOMemoryDescriptor *memo
 		if (pageBuses)
 			IOFree(pageBuses, pageCount * sizeof(uint64_t));
 		if (b.va) {
-			vmUnmap(*c, b.va, rounded);
-			vaGive(*c, b.va, rounded);
+			const bool unmapped = vmUnmap(*c, b.va, rounded);
+			const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed host-map cleanup");
+			if (invalidated) {
+				vaGive(*c, b.va, rounded);
+				releaseHost(b);
+			} else {
+				RLOG("vmid %u: failed host-map cleanup; host pages and VA retained", c->vmid);
+				leakHost(b);
+			}
+		} else {
+			releaseHost(b);
 		}
-		releaseHost(b);
 		b.owner = nullptr;
 		return kIOReturnNoMemory;
 	}
 	if (pageBuses)
 		IOFree(pageBuses, pageCount * sizeof(uint64_t));
 	if (!vmInvalidateOwned(*c, "host map")) {
-		vmUnmap(*c, b.va, rounded);
-		vaGive(*c, b.va, rounded);
-		releaseHost(b);
+		const bool unmapped = vmUnmap(*c, b.va, rounded);
+		const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed host-map rollback");
+		if (invalidated) {
+			vaGive(*c, b.va, rounded);
+			releaseHost(b);
+		} else {
+			RLOG("vmid %u: host-map rollback failed; host pages and VA retained", c->vmid);
+			leakHost(b);
+		}
 		b.owner = nullptr;
 		return kIOReturnNotResponding;
 	}
@@ -2832,10 +2846,17 @@ IOReturn RDNA4Compute::rtMapPages(const void *owner, const uint64_t *pageBuses, 
 	b.mapped = true;
 	if (!b.va || b.va + bytes < b.va || b.va + bytes > GpuVm::kVaEnd || !vmMapHost(*c, b.va, pageBuses, bytes, false)) {
 		if (b.va) {
-			vmUnmap(*c, b.va, bytes);
-			vaGive(*c, b.va, bytes);
+			const bool unmapped = vmUnmap(*c, b.va, bytes);
+			const bool invalidated = unmapped && vmInvalidateOwned(*c, "failed page-map cleanup");
+			if (invalidated) {
+				vaGive(*c, b.va, bytes);
+				b.owner = nullptr;
+			} else {
+				RLOG("vmid %u: failed page-map cleanup; mapping slot and VA retained for client close", c->vmid);
+			}
+		} else {
+			b.owner = nullptr;
 		}
-		b.owner = nullptr;
 		return kIOReturnNoMemory;
 	}
 	/* No invalidation: the range held no translation since rtFree invalidated it after its last unmap (or it was never mapped), as amdgpu
