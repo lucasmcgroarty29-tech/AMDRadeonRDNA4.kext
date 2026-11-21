@@ -4556,6 +4556,8 @@ void RDNA4Compute::resetRuntimeForResume() {
 		c.gfxFenceCpu = nullptr;                 // W12k: the ring is re-initialised by the wake's stageGfxRing; nothing of this client is pending
 		c.gfxFenceMc = 0;
 		c.gfxOutstanding = 0;
+		c.gfxQuarantined = false;
+		c.mapQuarantined = false;   // GPU reset discarded the old page tables and all stale translations
 	}
 	bzero(vmidUsed, sizeof(vmidUsed));
 	bzero(queueUsed, sizeof(queueUsed));
