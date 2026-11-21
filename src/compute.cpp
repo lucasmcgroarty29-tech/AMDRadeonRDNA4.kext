@@ -2693,11 +2693,35 @@ bool RDNA4Compute::sdmaQueueInit() {
 	const uint32_t status = rdGc(sdma(0, SdmaStatusReg));
 	const uint32_t rbCheck = rdGc(sdma(0, SdmaQ0RbCntl));
 	const uint32_t ibCheck = rdGc(sdma(0, SdmaQ0IbCntl));
+	const uint32_t baseLo = rdGc(sdma(0, SdmaQ0RbBase));
+	const uint32_t baseHi = rdGc(sdma(0, SdmaQ0RbBaseHi));
+	const uint32_t rptrLo = rdGc(sdma(0, SdmaQ0RbRptr));
+	const uint32_t rptrHi = rdGc(sdma(0, SdmaQ0RbRptrHi));
+	const uint32_t wptrLo = rdGc(sdma(0, SdmaQ0RbWptr));
+	const uint32_t wptrHi = rdGc(sdma(0, SdmaQ0RbWptrHi));
+	const uint32_t pollLo = rdGc(sdma(0, SdmaQ0WptrPollLo));
+	const uint32_t pollHi = rdGc(sdma(0, SdmaQ0WptrPollHi));
+	const uint32_t rptrAddrLo = rdGc(sdma(0, SdmaQ0RptrAddrLo));
+	const uint32_t rptrAddrHi = rdGc(sdma(0, SdmaQ0RptrAddrHi));
+	const uint32_t expectedBaseLo = static_cast<uint32_t>(ring >> 8);
+	const uint32_t expectedBaseHi = static_cast<uint32_t>(ring >> 40);
+	const uint32_t expectedPollLo = static_cast<uint32_t>(wpoll);
+	const uint32_t expectedPollHi = static_cast<uint32_t>(wpoll >> 32);
+	const uint32_t expectedRptrLo = static_cast<uint32_t>(rwb) & ~3u;
+	const uint32_t expectedRptrHi = static_cast<uint32_t>(rwb >> 32);
 	if (status == kBad || !(status & kSdmaUcodeInitDone) ||
 	    rbCheck == kBad || !(rbCheck & kSdmaRbEnable) ||
-	    ibCheck == kBad || !(ibCheck & kSdmaIbEnable)) {
-		CLOG("sdma: queue enable readback failed: status 0x%08x RB_CNTL 0x%08x IB_CNTL 0x%08x",
-		     status, rbCheck, ibCheck);
+	    ibCheck == kBad || !(ibCheck & kSdmaIbEnable) ||
+	    baseLo != expectedBaseLo || baseHi != expectedBaseHi ||
+	    rptrLo != static_cast<uint32_t>(sdmaStartPtr) ||
+	    rptrHi != static_cast<uint32_t>(sdmaStartPtr >> 32) ||
+	    wptrLo != static_cast<uint32_t>(sdmaStartPtr) ||
+	    wptrHi != static_cast<uint32_t>(sdmaStartPtr >> 32) ||
+	    pollLo != expectedPollLo || pollHi != expectedPollHi ||
+	    rptrAddrLo != expectedRptrLo || rptrAddrHi != expectedRptrHi) {
+		CLOG("sdma: queue readback failed: status 0x%08x RB 0x%08x IB 0x%08x base 0x%08x:%08x rptr 0x%08x:%08x wptr 0x%08x:%08x poll 0x%08x:%08x rptrAddr 0x%08x:%08x",
+		     status, rbCheck, ibCheck, baseHi, baseLo, rptrHi, rptrLo,
+		     wptrHi, wptrLo, pollHi, pollLo, rptrAddrHi, rptrAddrLo);
 		return false;
 	}
 	return true;
